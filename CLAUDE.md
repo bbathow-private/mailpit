@@ -47,6 +47,15 @@ npm install && npm run package
 CGO_ENABLED=0 go build -ldflags "-w -X github.com/axllent/mailpit/config.Version=dev" -o mailpit
 ```
 
+### Docker
+```bash
+# Build image
+docker build -t mailpit:dev .
+
+# Run container (web UI on :8025, SMTP on :1025)
+docker run -d --name mailpit -p 8025:8025 -p 1025:1025 mailpit:dev
+```
+
 ### Testing with rqlite
 Set `MP_DATABASE=http://localhost:4001` to run tests against rqlite instead of SQLite.
 
