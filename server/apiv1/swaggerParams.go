@@ -6,12 +6,21 @@
 //nolint:unused
 package apiv1
 
-import "github.com/axllent/mailpit/internal/smtpd/chaos"
+import (
+	"github.com/axllent/mailpit/internal/smtpd/bouncerules"
+	"github.com/axllent/mailpit/internal/smtpd/chaos"
+)
 
 // swagger:parameters setChaosParams
 type setChaosParams struct {
 	// in: body
 	Body chaos.Triggers
+}
+
+// swagger:parameters setBounceRulesParams
+type setBounceRulesParams struct {
+	// in: body
+	Body []bouncerules.Rule
 }
 
 // swagger:parameters AttachmentParams

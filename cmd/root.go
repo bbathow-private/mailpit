@@ -11,6 +11,7 @@ import (
 	"github.com/axllent/mailpit/internal/logger"
 	"github.com/axllent/mailpit/internal/prometheus"
 	"github.com/axllent/mailpit/internal/smtpd"
+	"github.com/axllent/mailpit/internal/smtpd/bouncerules"
 	"github.com/axllent/mailpit/internal/smtpd/chaos"
 	"github.com/axllent/mailpit/internal/storage"
 	"github.com/axllent/mailpit/internal/tools"
@@ -140,6 +141,10 @@ func init() {
 	// Chaos
 	rootCmd.Flags().BoolVar(&chaos.Enabled, "enable-chaos", chaos.Enabled, "Enable Chaos functionality (API / web UI)")
 	rootCmd.Flags().StringVar(&config.ChaosTriggers, "chaos-triggers", config.ChaosTriggers, "Enable Chaos & set the triggers for SMTP server")
+
+	// Bounce rules
+	rootCmd.Flags().BoolVar(&bouncerules.Enabled, "enable-bounce-rules", bouncerules.Enabled, "Enable bounce rules functionality (API)")
+	rootCmd.Flags().StringVar(&config.BounceRulesFile, "bounce-rules-file", config.BounceRulesFile, "YAML file to load bounce rules from at startup (enables bounce rules)")
 
 	// POP3 server
 	rootCmd.Flags().StringVar(&config.POP3Listen, "pop3", config.POP3Listen, "POP3 server bind interface and port")
@@ -357,6 +362,14 @@ func initConfigFromEnv() {
 	// Chaos
 	chaos.Enabled = getEnabledFromEnv("MP_ENABLE_CHAOS")
 	config.ChaosTriggers = os.Getenv("MP_CHAOS_TRIGGERS")
+
+	// Bounce rules
+	if getEnabledFromEnv("MP_ENABLE_BOUNCE_RULES") {
+		bouncerules.Enabled = true
+	}
+	if len(os.Getenv("MP_BOUNCE_RULES_FILE")) > 0 {
+		config.BounceRulesFile = os.Getenv("MP_BOUNCE_RULES_FILE")
+	}
 
 	// POP3 server
 	if len(os.Getenv("MP_POP3_BIND_ADDR")) > 0 {

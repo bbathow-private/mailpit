@@ -12,6 +12,7 @@ import (
 	"github.com/axllent/mailpit/config"
 	"github.com/axllent/mailpit/internal/auth"
 	"github.com/axllent/mailpit/internal/logger"
+	"github.com/axllent/mailpit/internal/smtpd/bouncerules"
 	"github.com/axllent/mailpit/internal/stats"
 	"github.com/axllent/mailpit/internal/storage"
 	"github.com/axllent/mailpit/internal/tools"
@@ -46,6 +47,14 @@ func SaveToDatabase(origin net.Addr, from string, to []string, data []byte, smtp
 		logger.Log().Warnf("[smtpd] error parsing message: %s", err.Error())
 		stats.LogSMTPRejected()
 		return "", err
+	}
+
+	// check bounce rules (content-based rejection)
+	if rule, matched := bouncerules.Evaluate(from, to, data); matched {
+		code, msg := rule.SMTPResponse()
+		logger.Log().Infof("[smtpd] bounce rule matched: %d %s (rule: %s)", code, msg, rule.ID)
+		stats.LogSMTPRejected()
+		return "", fmt.Errorf("%d %s", code, msg)
 	}
 
 	// check / set the Return-Path based on SMTP from

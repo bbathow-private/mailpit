@@ -14,6 +14,7 @@ import (
 	"github.com/axllent/ghru/v2"
 	"github.com/axllent/mailpit/internal/auth"
 	"github.com/axllent/mailpit/internal/logger"
+	"github.com/axllent/mailpit/internal/smtpd/bouncerules"
 	"github.com/axllent/mailpit/internal/smtpd/chaos"
 	"github.com/axllent/mailpit/internal/snakeoil"
 	"github.com/axllent/mailpit/internal/spamassassin"
@@ -214,6 +215,9 @@ var (
 	// PrometheusListen address for Prometheus metrics server
 	// Empty = disabled, true= use existing web server, address = separate server
 	PrometheusListen string
+
+	// BounceRulesFile is a YAML file to load bounce rules from at startup
+	BounceRulesFile string
 
 	// ChaosTriggers are parsed and set in the chaos module
 	ChaosTriggers string
@@ -487,6 +491,14 @@ func VerifyConfig() error {
 
 	if chaos.Enabled {
 		logger.Log().Info("[chaos] is enabled")
+	}
+
+	if err := parseBounceRulesFile(); err != nil {
+		return err
+	}
+
+	if bouncerules.Enabled {
+		logger.Log().Info("[bounce-rules] is enabled")
 	}
 
 	// POP3 server

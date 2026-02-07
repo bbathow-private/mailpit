@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/axllent/mailpit/internal/logger"
+	"github.com/axllent/mailpit/internal/smtpd/bouncerules"
 	"github.com/axllent/mailpit/internal/smtpd/chaos"
 	"github.com/goccy/go-yaml"
 )
@@ -252,6 +253,28 @@ func validateForwardConfig() error {
 	}
 
 	logger.Log().Infof("[forward] enabling message forwarding to %s via %s:%d", SMTPForwardConfig.To, SMTPForwardConfig.Host, SMTPForwardConfig.Port)
+
+	return nil
+}
+
+func parseBounceRulesFile() error {
+	if BounceRulesFile == "" {
+		return nil
+	}
+
+	BounceRulesFile = filepath.Clean(BounceRulesFile)
+
+	if !isFile(BounceRulesFile) {
+		return fmt.Errorf("[bounce-rules] configuration not found or readable: %s", BounceRulesFile)
+	}
+
+	if err := bouncerules.LoadFromYAML(BounceRulesFile); err != nil {
+		return err
+	}
+
+	bouncerules.Enabled = true
+
+	logger.Log().Infof("[bounce-rules] loaded %d rules from %s", len(bouncerules.GetRules()), BounceRulesFile)
 
 	return nil
 }

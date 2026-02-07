@@ -7,6 +7,7 @@
 package apiv1
 
 import (
+	"github.com/axllent/mailpit/internal/smtpd/bouncerules"
 	"github.com/axllent/mailpit/internal/smtpd/chaos"
 	"github.com/axllent/mailpit/internal/stats"
 )
@@ -114,6 +115,15 @@ type chaosResponse struct {
 	//
 	// in: body
 	Body chaos.Triggers
+}
+
+// Response for the bounce rules configuration
+// swagger:response BounceRulesResponse
+type bounceRulesResponse struct {
+	// The current bounce rules
+	//
+	// in: body
+	Body []bouncerules.Rule
 }
 
 // Message headers

@@ -190,6 +190,11 @@ func apiRoutes() *mux.Router {
 	r.HandleFunc(config.Webroot+"api/v1/chaos", middleWareFunc(apiv1.GetChaos)).Methods("GET")
 	r.HandleFunc(config.Webroot+"api/v1/chaos", middleWareFunc(apiv1.SetChaos)).Methods("PUT")
 
+	// Bounce rules
+	r.HandleFunc(config.Webroot+"api/v1/bounce-rules", middleWareFunc(apiv1.GetBounceRules)).Methods("GET")
+	r.HandleFunc(config.Webroot+"api/v1/bounce-rules", middleWareFunc(apiv1.SetBounceRules)).Methods("PUT")
+	r.HandleFunc(config.Webroot+"api/v1/bounce-rules", middleWareFunc(apiv1.ClearBounceRules)).Methods("DELETE")
+
 	// Prometheus metrics (if enabled and using existing server)
 	if prometheus.GetMode() == "integrated" {
 		r.HandleFunc(config.Webroot+"metrics", middleWareFunc(func(w http.ResponseWriter, r *http.Request) {
