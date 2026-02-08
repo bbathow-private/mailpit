@@ -1,0 +1,27 @@
+rules:
+  - field: subject
+    pattern: "BOUNCE-HARD"
+    action: hard_bounce
+    priority: 1
+
+  - field: subject
+    pattern: "BOUNCE-SOFT"
+    action: soft_bounce
+    priority: 2
+
+  - field: to
+    pattern: "hard-bounce@"
+    action: hard_bounce
+    priority: 3
+
+  - field: header
+    header_name: X-Test-Bounce
+    pattern: "^reject$"
+    action: reject
+    priority: 4
+
+  - field: header
+    header_name: X-Test-Bounce
+    pattern: "^quota$"
+    action: quota_full
+    priority: 5

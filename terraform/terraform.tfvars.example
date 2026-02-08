@@ -1,0 +1,22 @@
+# Azure
+location             = "germanywestcentral"
+vm_size              = "Standard_B1s"
+admin_username       = "azureuser"
+admin_ssh_public_key = "ssh-ed25519 AAAA... you@host"
+allowed_ssh_cidr     = "203.0.113.0/32" # your IP
+
+# Cloudflare
+cloudflare_api_token = "cf-api-token-with-dns-edit"
+cloudflare_zone_id   = "zone-id-from-cloudflare-dashboard"
+
+# Domain & TLS
+domain           = "mailpit.example.com"
+letsencrypt_email = "you@example.com"
+
+# Mailpit
+mailpit_version = "1.21.8"
+# mailpit_download_url = "https://your-custom-build-url/mailpit-linux-amd64.tar.gz"
+
+# Optional: basic auth for web UI
+# ui_auth_user     = "admin"
+# ui_auth_password = "changeme"
