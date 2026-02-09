@@ -1,0 +1,144 @@
+name: Integration Tests
+on:
+  pull_request:
+    branches: [develop, 'feature/**']
+  push:
+    branches: [develop, 'feature/**']
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Build Docker image
+      run: docker build -t mailpit:test .
+
+    - name: Start mailpit container
+      run: |
+        docker run -d --name mailpit-test \
+          -p 11025:1025 -p 18025:8025 \
+          -e MP_ENABLE_BOUNCE_RULES=true \
+          mailpit:test
+        sleep 3
+        docker logs mailpit-test
+
+    - name: Wait for mailpit to be ready
+      run: |
+        for i in $(seq 1 30); do
+          curl -sf http://127.0.0.1:18025/api/v1/messages > /dev/null 2>&1 && break
+          echo "Waiting for mailpit... ($i)"
+          sleep 1
+        done
+
+    - name: Load bounce rules via API
+      run: |
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT http://127.0.0.1:18025/api/v1/bounce-rules \
+          -H 'Content-Type: application/json' \
+          -d '[
+            {"field":"subject","pattern":"BOUNCE-HARD","action":"hard_bounce","priority":1},
+            {"field":"subject","pattern":"BOUNCE-SOFT","action":"soft_bounce","priority":2},
+            {"field":"to","pattern":"hard-bounce@","action":"hard_bounce","priority":3},
+            {"field":"header","header_name":"X-Test-Bounce","pattern":"^reject$","action":"reject","priority":4},
+            {"field":"header","header_name":"X-Test-Bounce","pattern":"^quota$","action":"quota_full","priority":5},
+            {"field":"body","pattern":"trigger-mailbox-full","action":"quota_full","priority":6}
+          ]')
+        echo "PUT bounce rules: HTTP $HTTP_CODE"
+        [ "$HTTP_CODE" = "200" ]
+
+    - name: Verify bounce rules loaded
+      run: |
+        RULES=$(curl -s http://127.0.0.1:18025/api/v1/bounce-rules)
+        COUNT=$(echo "$RULES" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+        echo "Rules loaded: $COUNT"
+        [ "$COUNT" = "6" ]
+        FIRST=$(echo "$RULES" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['priority'])")
+        echo "First rule priority: $FIRST"
+        [ "$FIRST" = "1" ]
+
+    - name: "Test: normal mail delivery"
+      run: |
+        echo -e "Subject: Hello World\r\n\r\nNormal email body" | curl -s --url smtp://127.0.0.1:11025 \
+          --mail-from sender@example.com --mail-rcpt rcpt@example.com --upload-file -
+        sleep 1
+        COUNT=$(curl -s http://127.0.0.1:18025/api/v1/messages | python3 -c "import sys,json; print(json.load(sys.stdin)['messages_count'])")
+        echo "Messages after normal send: $COUNT"
+        [ "$COUNT" -ge 1 ]
+
+    - name: "Test: subject BOUNCE-HARD (expect 550)"
+      run: |
+        OUTPUT=$(echo -e "Subject: BOUNCE-HARD test\r\n\r\nBody" | curl -s -v --url smtp://127.0.0.1:11025 \
+          --mail-from sender@example.com --mail-rcpt rcpt@example.com --upload-file - 2>&1) || true
+        echo "$OUTPUT"
+        echo "$OUTPUT" | grep -q "550"
+
+    - name: "Test: subject BOUNCE-SOFT (expect 451)"
+      run: |
+        OUTPUT=$(echo -e "Subject: BOUNCE-SOFT test\r\n\r\nBody" | curl -s -v --url smtp://127.0.0.1:11025 \
+          --mail-from sender@example.com --mail-rcpt rcpt@example.com --upload-file - 2>&1) || true
+        echo "$OUTPUT"
+        echo "$OUTPUT" | grep -q "451"
+
+    - name: "Test: to hard-bounce@ (expect 550)"
+      run: |
+        OUTPUT=$(echo -e "Subject: Normal\r\nTo: hard-bounce@example.com\r\n\r\nBody" | curl -s -v --url smtp://127.0.0.1:11025 \
+          --mail-from sender@example.com --mail-rcpt hard-bounce@example.com --upload-file - 2>&1) || true
+        echo "$OUTPUT"
+        echo "$OUTPUT" | grep -q "550"
+
+    - name: "Test: header X-Test-Bounce reject (expect 554)"
+      run: |
+        OUTPUT=$(echo -e "Subject: Normal\r\nX-Test-Bounce: reject\r\n\r\nBody" | curl -s -v --url smtp://127.0.0.1:11025 \
+          --mail-from sender@example.com --mail-rcpt rcpt@example.com --upload-file - 2>&1) || true
+        echo "$OUTPUT"
+        echo "$OUTPUT" | grep -q "554"
+
+    - name: "Test: header X-Test-Bounce quota (expect 452)"
+      run: |
+        OUTPUT=$(echo -e "Subject: Normal\r\nX-Test-Bounce: quota\r\n\r\nBody" | curl -s -v --url smtp://127.0.0.1:11025 \
+          --mail-from sender@example.com --mail-rcpt rcpt@example.com --upload-file - 2>&1) || true
+        echo "$OUTPUT"
+        echo "$OUTPUT" | grep -q "452"
+
+    - name: "Test: body trigger-mailbox-full (expect 452)"
+      run: |
+        OUTPUT=$(echo -e "Subject: Normal\r\n\r\nPlease trigger-mailbox-full now" | curl -s -v --url smtp://127.0.0.1:11025 \
+          --mail-from sender@example.com --mail-rcpt rcpt@example.com --upload-file - 2>&1) || true
+        echo "$OUTPUT"
+        echo "$OUTPUT" | grep -q "452"
+
+    - name: "Test: non-matching mail still delivers"
+      run: |
+        BEFORE=$(curl -s http://127.0.0.1:18025/api/v1/messages | python3 -c "import sys,json; print(json.load(sys.stdin)['messages_count'])")
+        echo -e "Subject: Completely normal\r\n\r\nNo triggers here" | curl -s --url smtp://127.0.0.1:11025 \
+          --mail-from sender@example.com --mail-rcpt rcpt@example.com --upload-file -
+        sleep 1
+        AFTER=$(curl -s http://127.0.0.1:18025/api/v1/messages | python3 -c "import sys,json; print(json.load(sys.stdin)['messages_count'])")
+        echo "Before: $BEFORE, After: $AFTER"
+        [ "$AFTER" -gt "$BEFORE" ]
+
+    - name: "Test: DELETE clears all rules"
+      run: |
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE http://127.0.0.1:18025/api/v1/bounce-rules)
+        echo "DELETE: HTTP $HTTP_CODE"
+        [ "$HTTP_CODE" = "200" ]
+        COUNT=$(curl -s http://127.0.0.1:18025/api/v1/bounce-rules | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+        echo "Rules remaining: $COUNT"
+        [ "$COUNT" = "0" ]
+
+    - name: "Test: previously bounced mail delivers after rules cleared"
+      run: |
+        BEFORE=$(curl -s http://127.0.0.1:18025/api/v1/messages | python3 -c "import sys,json; print(json.load(sys.stdin)['messages_count'])")
+        echo -e "Subject: BOUNCE-HARD test\r\n\r\nBody" | curl -s --url smtp://127.0.0.1:11025 \
+          --mail-from sender@example.com --mail-rcpt rcpt@example.com --upload-file -
+        sleep 1
+        AFTER=$(curl -s http://127.0.0.1:18025/api/v1/messages | python3 -c "import sys,json; print(json.load(sys.stdin)['messages_count'])")
+        echo "Before: $BEFORE, After: $AFTER"
+        [ "$AFTER" -gt "$BEFORE" ]
+
+    - name: Show mailpit logs
+      if: always()
+      run: docker logs mailpit-test
+
+    - name: Cleanup
+      if: always()
+      run: docker rm -f mailpit-test
