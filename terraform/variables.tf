@@ -67,7 +67,7 @@ variable "letsencrypt_email" {
 variable "mailpit_version" {
   description = "Mailpit release version to install (e.g. 1.21.8). Set to empty string and provide mailpit_download_url for custom builds."
   type        = string
-  default     = "1.21.8"
+  default     = "0.1.0"
 }
 
 variable "mailpit_download_url" {

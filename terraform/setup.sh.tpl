@@ -22,7 +22,7 @@ mkdir -p /etc/mailpit/tls
 %{ if mailpit_download_url != "" ~}
 DOWNLOAD_URL="${mailpit_download_url}"
 %{ else ~}
-DOWNLOAD_URL="https://github.com/axllent/mailpit/releases/download/v${mailpit_version}/mailpit-linux-amd64.tar.gz"
+DOWNLOAD_URL="https://github.com/bbathow-private/mailpit/releases/download/v${mailpit_version}/mailpit-linux-amd64.tar.gz"
 %{ endif ~}
 
 echo "Downloading mailpit from $DOWNLOAD_URL"
