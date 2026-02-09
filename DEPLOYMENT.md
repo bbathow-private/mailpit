@@ -96,6 +96,27 @@ No Postfix, no reverse proxy.
 
 For automated provisioning on Azure, see the `terraform/` directory.
 
+### Running Terraform
+
+Keep secrets and state outside the repo:
+
+```bash
+mkdir -p ~/secrets/mailpit-terraform
+cp terraform/terraform.tfvars.example ~/secrets/mailpit-terraform/mailpit.tfvars
+# Edit ~/secrets/mailpit-terraform/mailpit.tfvars with your values
+```
+
+```bash
+terraform -chdir=terraform init \
+  -backend-config="path=$HOME/secrets/mailpit-terraform/mailpit.tfstate"
+
+terraform -chdir=terraform plan \
+  -var-file="$HOME/secrets/mailpit-terraform/mailpit.tfvars"
+
+terraform -chdir=terraform apply \
+  -var-file="$HOME/secrets/mailpit-terraform/mailpit.tfvars"
+```
+
 ## 1. Obtain a TLS certificate
 
 ```bash
