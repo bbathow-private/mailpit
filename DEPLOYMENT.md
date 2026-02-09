@@ -106,6 +106,13 @@ cp terraform/terraform.tfvars.example ~/secrets/mailpit-terraform/mailpit.tfvars
 # Edit ~/secrets/mailpit-terraform/mailpit.tfvars with your values
 ```
 
+Set your Azure tenant and subscription (or use `az login --tenant YOUR_TENANT_ID` instead):
+
+```bash
+export ARM_TENANT_ID="your-tenant-id"
+export ARM_SUBSCRIPTION_ID="your-subscription-id"
+```
+
 ```bash
 terraform -chdir=terraform init \
   -backend-config="path=$HOME/secrets/mailpit-terraform/mailpit.tfstate"
@@ -174,7 +181,7 @@ ExecStart=/usr/local/bin/mailpit \
   --bounce-rules-file /etc/mailpit/bounce-rules.yaml
 Restart=on-failure
 RestartSec=5
-NoNewPrivileges=true
+NoNewPrivileges=false
 ProtectSystem=strict
 ReadWritePaths=/tmp
 ReadOnlyPaths=/etc/mailpit
@@ -250,7 +257,7 @@ ExecStart=/usr/local/bin/mailpit \
   --bounce-rules-file /etc/mailpit/bounce-rules.yaml
 Restart=on-failure
 RestartSec=5
-NoNewPrivileges=true
+NoNewPrivileges=false
 ProtectSystem=strict
 ReadWritePaths=/tmp
 ReadOnlyPaths=/etc/mailpit

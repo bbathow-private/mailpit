@@ -116,7 +116,7 @@ ExecStart=/usr/local/bin/mailpit \
   --bounce-rules-file /etc/mailpit/bounce-rules.yaml
 Restart=on-failure
 RestartSec=5
-NoNewPrivileges=true
+NoNewPrivileges=false
 ProtectSystem=strict
 ReadWritePaths=/tmp
 ReadOnlyPaths=/etc/mailpit
