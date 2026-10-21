@@ -117,6 +117,15 @@ func TestCmdEHLO(t *testing.T) {
 	cmdCode(t, conn, "RCPT TO:  <recipient\rexample.com>", "501")
 	cmdCode(t, conn, "RCPT TO: <>", "501") // empty address not allowed here
 
+	// RFC 5321 §4.1.2: quoted local-parts may contain SP and other qtextSMTP chars (issue #731)
+	cmdCode(t, conn, `RCPT TO:<"odd user"@example.com>`, "250")
+	cmdCode(t, conn, `RCPT TO:<"odd"@example.com>`, "250")
+	cmdCode(t, conn, `RCPT TO:<"a@b"@example.com>`, "250")
+	cmdCode(t, conn, `RCPT TO:<"odd\user"@example.com>`, "250")
+	// but CR and NUL are still rejected inside a quoted-string (GHSA-54wq-72mp-cq7c)
+	cmdCode(t, conn, "RCPT TO:<\"odd\ruser\"@example.com>", "553")
+	cmdCode(t, conn, "RCPT TO:<\"odd\x00user\"@example.com>", "553")
+
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 	cmdCode(t, conn, "DATA", "503")
 
@@ -207,6 +216,15 @@ func TestCmdMAIL(t *testing.T) {
 	cmdCode(t, conn, "MAIL FROM: < sender@example.com>", "553")
 	cmdCode(t, conn, "MAIL FROM: <sender@example.com >", "553")
 
+	// RFC 5321 §4.1.2: quoted local-parts may contain SP and other qtextSMTP chars (issue #731)
+	cmdCode(t, conn, `MAIL FROM:<"odd user"@example.com>`, "250")
+	cmdCode(t, conn, `MAIL FROM:<"odd"@example.com>`, "250")
+	cmdCode(t, conn, `MAIL FROM:<"a@b"@example.com>`, "250")
+	cmdCode(t, conn, `MAIL FROM:<"odd\user"@example.com>`, "250")
+	// but CR and NUL are still rejected inside a quoted-string (GHSA-54wq-72mp-cq7c)
+	cmdCode(t, conn, "MAIL FROM:<\"odd\ruser\"@example.com>", "553")
+	cmdCode(t, conn, "MAIL FROM:<\"odd\x00user\"@example.com>", "553")
+
 	// MAIL with valid SIZE parameter should return 250 Ok
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=1000", "250")
 
@@ -215,14 +233,28 @@ func TestCmdMAIL(t *testing.T) {
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE= ", "501")
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=foo", "501")
 
-	// MAIL with options should be ignored except for SIZE
-	cmdCode(t, conn, "MAIL FROM:<sender@example.com> BODY=8BITMIME", "250")           // ignored
-	cmdCode(t, conn, "MAIL FROM:<sender@example.com> BODY=8BITMIME,SIZE=1000", "250") // size detected
-	cmdCode(t, conn, "MAIL FROM:<sender@example.com> BODY=8BITMIME,SIZE=foo", "501")  // ignored
+	// MAIL with BODY and SIZE parameters (space-separated per RFC 5321)
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> BODY=8BITMIME", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> BODY=8BITMIME SIZE=1000", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=1000 BODY=8BITMIME", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> BODY=8BITMIME SIZE=foo", "501")
 
-	// TODO: MAIL with valid AUTH parameter should return 250 Ok
+	// MAIL with valid AUTH parameter should return 250 Ok
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> AUTH=<>", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> AUTH=username", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> AUTH=user@example.com", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> AUTH=user+2Bname", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=1000 AUTH=username", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> AUTH=username SIZE=1000", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> BODY=8BITMIME SIZE=1000 AUTH=username", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> AUTH=username BODY=8BITMIME SIZE=1000", "250")
 
-	// TODO: MAIL with invalid AUTH parameter must return 501 syntax error
+	// MAIL with invalid AUTH parameter must return 501 syntax error
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> AUTH=", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> AUTH= ", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> AUTH=user+ZZ", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> AUTH=user=name", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> AUTH=user+", "501")
 
 	cmdCode(t, conn, "QUIT", "221")
 	_ = conn.Close()
@@ -395,7 +427,7 @@ type mockHandler struct {
 }
 
 func (m *mockHandler) handler(err error) func(a net.Addr, f string, t []string, d []byte) error {
-	return func(a net.Addr, f string, t []string, d []byte) error {
+	return func(_ net.Addr, _ string, _ []string, _ []byte) error {
 		m.handlerCalled++
 		return err
 	}
@@ -779,8 +811,8 @@ func parseExtensions(t *testing.T, greeting string) map[string]string {
 
 			// Add line as extension.
 			line = strings.TrimSpace(line[4:]) // Strip code prefix and trailing \r\n
-			if idx := strings.Index(line, " "); idx != -1 {
-				extensions[line[:idx]] = line[idx+1:]
+			if before, after, ok := strings.Cut(line, " "); ok {
+				extensions[before] = after
 			} else {
 				extensions[line] = ""
 			}
@@ -884,6 +916,105 @@ func TestMakeEHLOResponse(t *testing.T) {
 	if !rePlain.MatchString(extensions["AUTH"]) {
 		t.Errorf("AUTH mechanism PLAIN does not appear in the extension list when an AuthHandler is specified and TLS is in use")
 	}
+
+	// 8BITMIME should always be advertised
+	s.srv = &Server{}
+	s.tls = false
+	extensions = parseExtensions(t, s.makeEHLOResponse())
+	if _, ok := extensions["8BITMIME"]; !ok {
+		t.Errorf("8BITMIME does not appear in the extension list")
+	}
+
+	// SMTPUTF8 should always be advertised
+	if _, ok := extensions["SMTPUTF8"]; !ok {
+		t.Errorf("SMTPUTF8 does not appear in the extension list")
+	}
+
+	// ENHANCEDSTATUSCODES should always be advertised
+	if _, ok := extensions["ENHANCEDSTATUSCODES"]; !ok {
+		t.Errorf("ENHANCEDSTATUSCODES does not appear in the extension list")
+	}
+}
+
+// Test 8BITMIME BODY parameter parsing in MAIL FROM command
+func TestCmd8BITMIME(t *testing.T) {
+	srv := &Server{}
+	conn := newConn(t, srv)
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+
+	// Create a session to check internal state
+	clientConn, serverConn := net.Pipe()
+	session := srv.newSession(serverConn)
+	go session.serve()
+
+	// Read and discard banner
+	_, _ = bufio.NewReader(clientConn).ReadString('\n')
+
+	// Send EHLO
+	_, _ = fmt.Fprintf(clientConn, "EHLO test.example.com\r\n")
+	reader := bufio.NewReader(clientConn)
+	for {
+		line, _ := reader.ReadString('\n')
+		if strings.HasPrefix(line, "250 ") {
+			break
+		}
+	}
+
+	// Test BODY=8BITMIME parameter
+	_, _ = fmt.Fprintf(clientConn, "MAIL FROM:<sender@example.com> BODY=8BITMIME\r\n")
+	resp, _ := reader.ReadString('\n')
+	if !strings.HasPrefix(resp, "250") {
+		t.Errorf("MAIL FROM with BODY=8BITMIME failed: %s", resp)
+	}
+
+	// Verify bodyEncoding was set (we can't directly access it, but we can test the behavior)
+	// Reset and test BODY=7BIT
+	_, _ = fmt.Fprintf(clientConn, "RSET\r\n")
+	_, _ = reader.ReadString('\n')
+
+	_, _ = fmt.Fprintf(clientConn, "MAIL FROM:<sender@example.com> BODY=7BIT\r\n")
+	resp, _ = reader.ReadString('\n')
+	if !strings.HasPrefix(resp, "250") {
+		t.Errorf("MAIL FROM with BODY=7BIT failed: %s", resp)
+	}
+
+	// Test BODY parameter with SIZE parameter
+	_, _ = fmt.Fprintf(clientConn, "RSET\r\n")
+	_, _ = reader.ReadString('\n')
+
+	_, _ = fmt.Fprintf(clientConn, "MAIL FROM:<sender@example.com> SIZE=1000 BODY=8BITMIME\r\n")
+	resp, _ = reader.ReadString('\n')
+	if !strings.HasPrefix(resp, "250") {
+		t.Errorf("MAIL FROM with SIZE and BODY parameters failed: %s", resp)
+	}
+
+	// Test case insensitivity
+	_, _ = fmt.Fprintf(clientConn, "RSET\r\n")
+	_, _ = reader.ReadString('\n')
+
+	_, _ = fmt.Fprintf(clientConn, "MAIL FROM:<sender@example.com> body=8bitmime\r\n")
+	resp, _ = reader.ReadString('\n')
+	if !strings.HasPrefix(resp, "250") {
+		t.Errorf("MAIL FROM with lowercase body parameter failed: %s", resp)
+	}
+
+	// Clean up
+	_, _ = fmt.Fprintf(clientConn, "QUIT\r\n")
+	_, _ = reader.ReadString('\n')
+	_ = clientConn.Close()
+
+	// Also test via the original connection
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> BODY=8BITMIME", "250")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
+
+	cmdCode(t, conn, "RSET", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> BODY=7BIT", "250")
+
+	cmdCode(t, conn, "RSET", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> BODY=8BITMIME SIZE=5000", "250")
+
+	cmdCode(t, conn, "QUIT", "221")
+	_ = conn.Close()
 }
 
 // func createTmpFile(content string) (file *os.File, err error) {
@@ -1603,7 +1734,7 @@ func BenchmarkReceive(b *testing.B) {
 	b.ResetTimer()
 
 	// Benchmark a full mail transaction.
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, _ = fmt.Fprintf(clientConn, "%s\r\n", "HELO host.example.com")
 		_, _ = reader.ReadString('\n')
 		_, _ = fmt.Fprintf(clientConn, "%s\r\n", "MAIL FROM:<sender@example.com>")
@@ -1671,14 +1802,14 @@ type mockDropRejectedHandler struct {
 	lastMsgIDTo   []string
 }
 
-func (m *mockDropRejectedHandler) handler(remoteAddr net.Addr, from string, to []string, data []byte) error {
+func (m *mockDropRejectedHandler) handler(_ net.Addr, from string, to []string, _ []byte) error {
 	m.handlerCalled++
 	m.lastFrom = from
 	m.lastTo = append([]string{}, to...) // copy slice
 	return nil
 }
 
-func (m *mockDropRejectedHandler) msgIDHandler(remoteAddr net.Addr, from string, to []string, data []byte, username *string) (string, error) {
+func (m *mockDropRejectedHandler) msgIDHandler(_ net.Addr, from string, to []string, _ []byte, _ *string) (string, error) {
 	m.msgIDCalled++
 	m.lastMsgIDFrom = from
 	m.lastMsgIDTo = append([]string{}, to...) // copy slice
@@ -1699,7 +1830,7 @@ func TestIgnoreRejectedRecipients(t *testing.T) {
 		{
 			name:                     "Disabled_DefaultBehavior",
 			IgnoreRejectedRecipients: false,
-			handlerRcpt: func(remoteAddr net.Addr, from string, to string) bool {
+			handlerRcpt: func(_ net.Addr, _ string, to string) bool {
 				return !strings.HasSuffix(to, "@rejected.com")
 			},
 			rcptCommands: []struct{ addr, expectedCode string }{
@@ -1712,7 +1843,7 @@ func TestIgnoreRejectedRecipients(t *testing.T) {
 		{
 			name:                     "Enabled_MixedRecipients",
 			IgnoreRejectedRecipients: true,
-			handlerRcpt: func(remoteAddr net.Addr, from string, to string) bool {
+			handlerRcpt: func(_ net.Addr, _ string, to string) bool {
 				return !strings.HasSuffix(to, "@rejected.com")
 			},
 			rcptCommands: []struct{ addr, expectedCode string }{
@@ -1727,7 +1858,7 @@ func TestIgnoreRejectedRecipients(t *testing.T) {
 		{
 			name:                     "Enabled_AllRejected",
 			IgnoreRejectedRecipients: true,
-			handlerRcpt: func(remoteAddr net.Addr, from string, to string) bool {
+			handlerRcpt: func(_ net.Addr, _ string, _ string) bool {
 				return false // Reject all
 			},
 			rcptCommands: []struct{ addr, expectedCode string }{
@@ -1740,7 +1871,7 @@ func TestIgnoreRejectedRecipients(t *testing.T) {
 		{
 			name:                     "Enabled_OnlyValid",
 			IgnoreRejectedRecipients: true,
-			handlerRcpt: func(remoteAddr net.Addr, from string, to string) bool {
+			handlerRcpt: func(_ net.Addr, _ string, to string) bool {
 				return strings.HasSuffix(to, "@valid.com")
 			},
 			rcptCommands: []struct{ addr, expectedCode string }{
@@ -1754,7 +1885,7 @@ func TestIgnoreRejectedRecipients(t *testing.T) {
 		{
 			name:                     "Enabled_WithMsgIDHandler",
 			IgnoreRejectedRecipients: true,
-			handlerRcpt: func(remoteAddr net.Addr, from string, to string) bool {
+			handlerRcpt: func(_ net.Addr, _ string, to string) bool {
 				return !strings.HasSuffix(to, "@rejected.com")
 			},
 			rcptCommands: []struct{ addr, expectedCode string }{
@@ -1828,5 +1959,50 @@ func TestIgnoreRejectedRecipients(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestCommandLineLengthLimit verifies that oversized SMTP command lines are rejected
+// without buffering the full attacker-controlled input (GHSA-w878-pj84-3j5v).
+// RFC 5321 section 4.5.3.1.4 limits command lines to 512 octets including CRLF.
+func TestCommandLineLengthLimit(t *testing.T) {
+	// Normal command must pass through unchanged.
+	shortSession := session{srv: &Server{}, br: bufio.NewReaderSize(strings.NewReader("NOOP\r\n"), 2048)}
+	line, err := shortSession.readLine()
+	if err != nil {
+		t.Fatalf("short command readLine failed: %v", err)
+	}
+	if line != "NOOP" {
+		t.Fatalf("expected NOOP, got %q", line)
+	}
+
+	// An 8 MiB command line must be rejected before it is returned to the caller.
+	oversized := strings.Repeat("X", 8*1024*1024) + "\r\n"
+	oversizedSession := session{srv: &Server{}, br: bufio.NewReaderSize(bytes.NewBufferString(oversized), 2048)}
+	_, err = oversizedSession.readLine()
+	if err == nil {
+		t.Fatal("oversized command was accepted; expected errLineTooLong")
+	}
+	if err != errLineTooLong {
+		t.Fatalf("expected errLineTooLong, got %v", err)
+	}
+
+	// A command that exactly fills the buffer must pass through.
+	fits := strings.Repeat("X", 2047) + "\n"
+	fitsSession := session{srv: &Server{}, br: bufio.NewReaderSize(strings.NewReader(fits), 2048)}
+	_, err = fitsSession.readLine()
+	if err != nil {
+		t.Fatalf("command that fits buffer was rejected: %v", err)
+	}
+}
+
+// TestAuthContinuationLineLengthLimit verifies that oversized AUTH continuation
+// lines (handled via the same readLine path) are also rejected.
+func TestAuthContinuationLineLengthLimit(t *testing.T) {
+	oversized := strings.Repeat("A", 8*1024*1024) + "\r\n"
+	s := session{srv: &Server{}, br: bufio.NewReaderSize(bytes.NewBufferString(oversized), 2048)}
+	_, err := s.readLine()
+	if err != errLineTooLong {
+		t.Fatalf("expected errLineTooLong for oversized AUTH continuation, got %v", err)
 	}
 }

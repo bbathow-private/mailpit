@@ -2,10 +2,13 @@
 package handlers
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -18,6 +21,12 @@ import (
 	"github.com/axllent/mailpit/internal/logger"
 	"github.com/axllent/mailpit/internal/storage"
 	"github.com/axllent/mailpit/internal/tools"
+)
+
+const (
+	// maxProxyBodySize is the maximum number of bytes read from a proxied
+	// response body (fonts, images, CSS). Prevents OOM on oversized responses.
+	maxProxyBodySize = 50 * 1024 * 1024 // 50 MB
 )
 
 var (
@@ -37,6 +46,11 @@ type MessageAssets struct {
 	Created time.Time
 	// Assets found in the message
 	Assets []string
+	// index keys every entry of Assets with strings.ToLower(url) for O(1)
+	// membership tests. Kept in sync with Assets under assetsMutex; the
+	// previous linear tools.InArray scan is quadratic in unique URL count
+	// when a proxied stylesheet contains many url() references.
+	index map[string]struct{}
 }
 
 func init() {
@@ -84,36 +98,52 @@ func ProxyHandler(w http.ResponseWriter, r *http.Request) {
 	id := parts[0]
 	uri := parts[1]
 
-	links, err := getAssets(id)
+	found, err := hasAsset(id, uri)
 	if err != nil {
 		httpError(w, "Error: invalid request")
 		return
 	}
 
-	if !tools.InArray(uri, links) {
+	if !found {
 		logger.Log().Warnf("[proxy] URL %s not found in message %s", uri, id)
 		httpError(w, "Error: invalid request")
 		return
 	}
 
-	if !linkRe.MatchString(uri) {
-		logger.Log().Warnf("[proxy] invalid request %s", uri)
-		httpError(w, "Error: invalid request")
+	if !linkRe.MatchString(uri) || !tools.IsValidLinkURL(uri) {
+		logger.Log().Warnf("[proxy] invalid URL %s", uri)
+		httpError(w, "Error: invalid URL")
 		return
 	}
 
-	tr := &http.Transport{}
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	tr := &http.Transport{
+		DialContext: safeDialContext(dialer),
+	}
 
 	if config.AllowUntrustedTLS {
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // #nosec
 	}
 
 	client := &http.Client{
-		Transport: tr,
 		Timeout:   10 * time.Second,
+		Transport: tr,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return errors.New("too many redirects")
+			}
+			if !tools.IsValidLinkURL(req.URL.String()) {
+				return fmt.Errorf("blocked redirect to invalid URL: %s", req.URL)
+			}
+			return nil
+		},
 	}
 
-	req, err := http.NewRequest("GET", uri, nil)
+	req, err := http.NewRequest("GET", uri, nil) // #nosec G704 -- URI is allowlisted via hasAsset + validated by IsValidLinkURL + internal IPs blocked by safeDialContext
 	if err != nil {
 		logger.Log().Warnf("[proxy] %s", err.Error())
 		httpError(w, "Error: invalid request")
@@ -123,7 +153,7 @@ func ProxyHandler(w http.ResponseWriter, r *http.Request) {
 	// use requesting useragent
 	req.Header.Set("User-Agent", r.UserAgent())
 
-	resp, err := client.Do(req)
+	resp, err := client.Do(req) // #nosec G704 -- URI is allowlisted via hasAsset + validated by IsValidLinkURL + internal IPs blocked by safeDialContext
 	if err != nil {
 		logger.Log().Warnf("[proxy] %s", err.Error())
 		httpError(w, "Error: invalid request")
@@ -145,10 +175,16 @@ func ProxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	limitedBody := io.LimitReader(resp.Body, maxProxyBodySize+1)
+	body, err := io.ReadAll(limitedBody)
 	if err != nil {
 		logger.Log().Warnf("[proxy] %s", err.Error())
 		httpError(w, "Error: invalid request")
+		return
+	}
+	if int64(len(body)) > maxProxyBodySize {
+		logger.Log().Warnf("[proxy] response body for %s exceeds %d bytes, blocking", uri, maxProxyBodySize)
+		httpError(w, "Error: response too large")
 		return
 	}
 
@@ -182,14 +218,7 @@ func ProxyHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// store asset address against message ID
-			if result, ok := assets[id]; ok {
-				if !tools.InArray(address, result.Assets) {
-					assetsMutex.Lock()
-					result.Assets = append(result.Assets, address)
-					assets[id] = result
-					assetsMutex.Unlock()
-				}
-			}
+			recordAsset(id, address)
 
 			// encode with base64 to handle any special characters and group message ID with URL
 			encoded := base64.StdEncoding.EncodeToString([]byte(id + ":" + address))
@@ -208,57 +237,99 @@ func ProxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// GetAssets retrieves and parses the message to return linked assets.
-// Linked CSS files are appended to the assets list via the ProxyHandler when proxying CSS files.
-func getAssets(id string) ([]string, error) {
+// recordAsset appends url to the cached asset set for the given message ID if
+// the message is already in the cache and the URL has not been seen. Membership
+// is O(1) via MessageAssets.index; the previous linear tools.InArray scan is
+// quadratic in unique URL count when a proxied stylesheet contains many url()
+// references.
+func recordAsset(id, url string) {
 	assetsMutex.Lock()
 	defer assetsMutex.Unlock()
 
 	result, ok := assets[id]
-	if ok {
-		// return cached assets
-		return result.Assets, nil
+	if !ok {
+		return
+	}
+	key := strings.ToLower(url)
+	if _, seen := result.index[key]; seen {
+		return
+	}
+	result.Assets = append(result.Assets, url)
+	result.index[key] = struct{}{}
+	assets[id] = result
+}
+
+// hasAsset reports whether url is a known asset URL for the message ID,
+// building and caching the initial asset set from the stored message HTML on
+// first call. The check is case-insensitive to preserve the semantics of the
+// previous tools.InArray-based implementation.
+func hasAsset(id, url string) (bool, error) {
+	assetsMutex.Lock()
+	defer assetsMutex.Unlock()
+
+	result, ok := assets[id]
+	if !ok {
+		built, err := buildAssets(id)
+		if err != nil {
+			return false, err
+		}
+		assets[id] = built
+		result = built
 	}
 
+	_, found := result.index[strings.ToLower(url)]
+	return found, nil
+}
+
+// buildAssets parses the stored message HTML and returns the initial set of
+// linked asset URLs. Callers must hold assetsMutex.
+func buildAssets(id string) (MessageAssets, error) {
 	msg, err := storage.GetMessage(id)
 	if err != nil {
-		return nil, err
+		return MessageAssets{}, err
 	}
 
 	links := []string{}
+	index := map[string]struct{}{}
+
+	add := func(link string) {
+		if !linkRe.MatchString(link) {
+			return
+		}
+		key := strings.ToLower(link)
+		if _, seen := index[key]; seen {
+			return
+		}
+		index[key] = struct{}{}
+		links = append(links, link)
+	}
 
 	reader := strings.NewReader(msg.HTML)
 
 	// load the HTML document
 	doc, err := goquery.NewDocumentFromReader(reader)
 	if err != nil {
-		return nil, err
+		return MessageAssets{}, err
 	}
 
 	// css & font links
 	doc.Find("link").Each(func(_ int, s *goquery.Selection) {
 		if href, exists := s.Attr("href"); exists {
-			if linkRe.MatchString(href) && !tools.InArray(href, links) {
-				links = append(links, href)
-			}
+			add(href)
 		}
 	})
 
 	// images
 	doc.Find("img").Each(func(_ int, s *goquery.Selection) {
 		if src, exists := s.Attr("src"); exists {
-			if linkRe.MatchString(src) && !tools.InArray(src, links) {
-				links = append(links, src)
-			}
+			add(src)
 		}
 	})
 
 	// background="<>" links
 	doc.Find("[background]").Each(func(_ int, s *goquery.Selection) {
 		if bg, exists := s.Attr("background"); exists {
-			if linkRe.MatchString(bg) && !tools.InArray(bg, links) {
-				links = append(links, bg)
-			}
+			add(bg)
 		}
 	})
 
@@ -266,20 +337,16 @@ func getAssets(id string) ([]string, error) {
 	matches := urlRe.FindAllStringSubmatch(msg.HTML, -1)
 	for _, match := range matches {
 		if len(match) >= 3 {
-			link := match[2]
-			if linkRe.MatchString(link) && !tools.InArray(link, links) {
-				links = append(links, link)
-			}
+			add(match[2])
 		}
 	}
 
-	r := MessageAssets{}
-	r.ID = id
-	r.Created = time.Now()
-	r.Assets = links
-	assets[id] = r
-
-	return links, nil
+	return MessageAssets{
+		ID:      id,
+		Created: time.Now(),
+		Assets:  links,
+		index:   index,
+	}, nil
 }
 
 // AbsoluteURL will return a full URL regardless whether it is relative or absolute.
@@ -321,9 +388,9 @@ func absoluteURL(link, baseURL string) (string, error) {
 func httpError(w http.ResponseWriter, msg string) {
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("Content-Security-Policy", config.ContentSecurityPolicy)
-	w.WriteHeader(http.StatusBadRequest)
 	w.Header().Set("Content-Type", "text/plain")
-	_, _ = fmt.Fprint(w, msg)
+	w.WriteHeader(http.StatusBadRequest)
+	_, _ = fmt.Fprint(w, msg) // #nosec G705 -- msg is always a hardcoded string literal, never user input
 }
 
 // SupportedProxyContentType checks if the content-type is supported for proxying.
@@ -356,4 +423,29 @@ func supportedProxyContentType(ct string) bool {
 	}
 
 	return false
+}
+
+// SafeDialContext is a custom dialer that checks if the resolved IP addresses are internal before allowing the connection.
+func safeDialContext(dialer *net.Dialer) func(ctx context.Context, network, address string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+
+		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+
+		if !config.AllowInternalHTTPRequests {
+			for _, ip := range ips {
+				if tools.IsInternalIP(ip.IP) {
+					return nil, fmt.Errorf("blocked request to %s (%s): private/reserved address", host, ip)
+				}
+			}
+		}
+
+		return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+	}
 }

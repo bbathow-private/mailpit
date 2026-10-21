@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -24,6 +25,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/axllent/mailpit/internal/connlimit"
+	"github.com/axllent/mailpit/internal/logger"
 	"github.com/axllent/mailpit/internal/smtpd/chaos"
 )
 
@@ -34,7 +37,13 @@ var (
 	mailFromRE = regexp.MustCompile(`(?i)FROM: ?<(|[^<>\v]+)>( |$)(.*)?`) // Delivery Status Notifications are sent with "MAIL FROM:<>"
 
 	// extract mail size from 'MAIL FROM' parameter
-	mailFromSizeRE = regexp.MustCompile(`(?U)(^| |,)[Ss][Ii][Zz][Ee]=(.*)($|,| )`)
+	mailFromSizeRE = regexp.MustCompile(`(?U)(^| )[Ss][Ii][Zz][Ee]=(.*)($| )`)
+
+	// extract auth from 'MAIL FROM' parameter
+	mailFromAuthRE = regexp.MustCompile(`(?U)(^| )[Aa][Uu][Tt][Hh]=(.*)($| )`)
+
+	// checkErrFormatRE matches SMTP error responses with a status code prefix
+	checkErrFormatRE = regexp.MustCompile(`^([2-5][0-9]{2})[\s\-](.+)$`)
 )
 
 // Handler function called upon successful receipt of an email.
@@ -53,6 +62,11 @@ type AuthHandler func(remoteAddr net.Addr, mechanism string, username []byte, pa
 
 // ErrServerClosed is the default message when a server closes a connection
 var ErrServerClosed = errors.New("Server has been closed")
+
+// errLineTooLong is returned by readLine when an SMTP command line exceeds the
+// maximum buffered length. Its text is a valid SMTP reply so callers may write
+// it directly to the client.
+var errLineTooLong = errors.New("500 5.5.2 Line too long")
 
 // ListenAndServe listens on the TCP network address addr
 // and then calls Serve with handler to handle requests
@@ -87,6 +101,10 @@ func maxSizeExceeded(limit int) maxSizeExceededError {
 func (err maxSizeExceededError) Error() string {
 	return fmt.Sprintf("552 5.3.4 Requested mail action aborted: exceeded storage allocation (%d)", err.limit)
 }
+
+// maxConnections is the maximum number of concurrent SMTP sessions.
+// It is a variable only so that tests can lower it.
+var maxConnections = connlimit.Max
 
 // LogFunc is a function capable of logging the client-server communication.
 type LogFunc func(remoteIP, verb, line string)
@@ -221,6 +239,15 @@ func (srv *Server) Serve(ln net.Listener) error {
 
 	defer func() { _ = ln.Close() }()
 
+	// Set before any session starts, as sessions share the server and run concurrently.
+	if srv.MaxRecipients == 0 {
+		srv.MaxRecipients = 100
+	}
+
+	limiter := connlimit.New("smtpd", maxConnections)
+
+	var backoff connlimit.Backoff
+
 	for {
 		// if we are shutting down, don't accept new connections
 		select {
@@ -234,12 +261,28 @@ func (srv *Server) Serve(ln net.Listener) error {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
+			// Errors such as running out of file descriptors are temporary,
+			// so back off and retry rather than bringing down the server.
+			if connlimit.Retryable(err) {
+				logger.Log().Errorf("[smtpd] accept error: %s", err.Error())
+				backoff.Wait()
+				continue
+			}
 			return err
+		}
+		backoff.Reset()
+
+		if !limiter.TryAcquire() {
+			connlimit.Refuse(conn, "421 4.3.2 Too many connections, please try again later\r\n")
+			continue
 		}
 
 		session := srv.newSession(conn)
 		atomic.AddInt32(&srv.openSessions, 1)
-		go session.serve()
+		go func() {
+			defer limiter.Release()
+			session.serve()
+		}()
 	}
 }
 
@@ -265,7 +308,7 @@ func (srv *Server) newSession(conn net.Conn) (s *session) {
 	s = &session{
 		srv:  srv,
 		conn: conn,
-		br:   bufio.NewReader(conn),
+		br:   bufio.NewReaderSize(conn, 2048),
 		bw:   bufio.NewWriter(conn),
 	}
 
@@ -337,7 +380,7 @@ func (srv *Server) Shutdown(ctx context.Context) error {
 	timer := time.NewTimer(100 * time.Millisecond)
 	defer timer.Stop()
 
-	for i := 0; i < 300; i++ {
+	for range 300 {
 		// wait for open sessions to close
 		if atomic.LoadInt32(&srv.openSessions) == 0 {
 			break
@@ -384,6 +427,10 @@ loop:
 		// On error, assume the client has gone away i.e. return from serve().
 		line, err := s.readLine()
 		if err != nil {
+			if errors.Is(err, errLineTooLong) {
+				s.writef("%s", err.Error())
+				continue
+			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				s.writef("421 4.4.2 %s %s ESMTP Service closing transmission channel after timeout exceeded", s.srv.Hostname, s.srv.AppName)
 			}
@@ -447,28 +494,41 @@ loop:
 					break
 				}
 
-				// Validate the SIZE parameter if one was sent.
+				// Validate parameters if sent.
 				if len(match[2]) > 0 { // A parameter is present
-					sizeMatch := mailFromSizeRE.FindStringSubmatch(match[3])
-					if sizeMatch == nil {
-						// ignore other parameter
-						from = match[1]
-						gotFROM = true
-						s.writef("250 2.1.0 Ok")
-					} else {
+					if authMatch := mailFromAuthRE.FindStringSubmatch(match[3]); authMatch != nil {
+						if !isValidAuthParam(authMatch[2]) {
+							s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid AUTH parameter)")
+							to = nil
+							hasRejectedRecipients = false
+							buffer.Reset()
+							break
+						}
+					}
+
+					if sizeMatch := mailFromSizeRE.FindStringSubmatch(match[3]); sizeMatch != nil {
 						// Enforce the maximum message size if one is set.
 						size, err := strconv.Atoi(sizeMatch[2])
 						if err != nil { // Bad SIZE parameter
 							s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid SIZE parameter)")
-						} else if s.srv.MaxSize > 0 && size > s.srv.MaxSize { // SIZE above maximum size, if set
+							to = nil
+							hasRejectedRecipients = false
+							buffer.Reset()
+							break
+						}
+						if s.srv.MaxSize > 0 && size > s.srv.MaxSize { // SIZE above maximum size, if set
 							err = maxSizeExceeded(s.srv.MaxSize)
 							s.writef("%s", err.Error())
-						} else { // SIZE ok
-							from = match[1]
-							gotFROM = true
-							s.writef("250 2.1.0 Ok")
+							to = nil
+							hasRejectedRecipients = false
+							buffer.Reset()
+							break
 						}
 					}
+
+					from = match[1]
+					gotFROM = true
+					s.writef("250 2.1.0 Ok")
 				} else { // No parameters after FROM
 					from = match[1]
 					gotFROM = true
@@ -558,6 +618,22 @@ loop:
 					s.writef("%s", err.Error())
 					continue
 				default:
+					// io.EOF / io.ErrUnexpectedEOF mean the client disconnected mid-DATA.
+					// Treat as client-gone and bail rather than sending a 451 into a dead socket.
+					if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+						if s.srv.LogRead != nil {
+							s.srv.LogRead(s.remoteIP, "READ", fmt.Sprintf("client disconnected during DATA: %s", err.Error()))
+						} else {
+							log.Printf("%s READ client disconnected during DATA: %s", s.remoteIP, err.Error())
+						}
+						break loop
+					}
+					// Surface the underlying error so operators can diagnose the 451.
+					if s.srv.LogWrite != nil {
+						s.srv.LogWrite(s.remoteIP, "ERROR", fmt.Sprintf("DATA read error: %s", err.Error()))
+					} else {
+						log.Printf("%s ERROR DATA read error: %s", s.remoteIP, err.Error())
+					}
 					s.writef("451 4.3.0 Requested action aborted: local error in processing")
 					continue
 				}
@@ -574,8 +650,7 @@ loop:
 			if len(to) > 0 && s.srv.Handler != nil {
 				err := s.srv.Handler(s.conn.RemoteAddr(), from, to, buffer.Bytes())
 				if err != nil {
-					checkErrFormat := regexp.MustCompile(`^([2-5][0-9]{2})[\s\-](.+)$`)
-					if checkErrFormat.MatchString(err.Error()) {
+					if checkErrFormatRE.MatchString(err.Error()) {
 						s.writef("%s", err.Error())
 					} else {
 						s.writef("451 4.3.5 Unable to process mail")
@@ -586,8 +661,7 @@ loop:
 			} else if len(to) > 0 && s.srv.MsgIDHandler != nil {
 				msgID, err := s.srv.MsgIDHandler(s.conn.RemoteAddr(), from, to, buffer.Bytes(), s.username)
 				if err != nil {
-					checkErrFormat := regexp.MustCompile(`^([2-5][0-9]{2})[\s\-](.+)$`)
-					if checkErrFormat.MatchString(err.Error()) {
+					if checkErrFormatRE.MatchString(err.Error()) {
 						s.writef("%s", err.Error())
 					} else {
 						s.writef("451 4.3.5 Unable to process mail")
@@ -636,9 +710,12 @@ loop:
 		case "XCLIENT":
 			s.xClient = args
 			if s.xClientTrust {
-				xCArgs := strings.Split(args, " ")
-				for _, xCArg := range xCArgs {
+				xCArgs := strings.SplitSeq(args, " ")
+				for xCArg := range xCArgs {
 					xCParse := strings.Split(strings.TrimSpace(xCArg), "=")
+					if len(xCParse) != 2 {
+						continue
+					}
 					if strings.ToUpper(xCParse[0]) == "ADDR" && (net.ParseIP(xCParse[1]) != nil) {
 						s.xClientADDR = xCParse[1]
 					}
@@ -697,7 +774,7 @@ loop:
 
 			// TLS handshake succeeded, switch to using the TLS connection.
 			s.conn = tlsConn
-			s.br = bufio.NewReader(s.conn)
+			s.br = bufio.NewReaderSize(s.conn, 2048)
 			s.bw = bufio.NewWriter(s.conn)
 			s.tls = true
 
@@ -786,7 +863,7 @@ loop:
 }
 
 // Wrapper function for writing a complete line to the socket.
-func (s *session) writef(format string, args ...interface{}) {
+func (s *session) writef(format string, args ...any) {
 	if s.srv.Timeout > 0 {
 		_ = s.conn.SetWriteDeadline(time.Now().Add(s.srv.Timeout))
 	}
@@ -806,16 +883,30 @@ func (s *session) writef(format string, args ...interface{}) {
 }
 
 // Read a complete line from the socket.
+// Lines longer than the reader buffer size are drained and rejected with errLineTooLong
+// so that oversized input never allocates an attacker-controlled amount of memory.
 func (s *session) readLine() (string, error) {
 	if s.srv.Timeout > 0 {
 		_ = s.conn.SetReadDeadline(time.Now().Add(s.srv.Timeout))
 	}
 
-	line, err := s.br.ReadString('\n')
+	lineBytes, isPrefix, err := s.br.ReadLine()
 	if err != nil {
 		return "", err
 	}
-	line = strings.TrimSpace(line) // Strip trailing \r\n
+
+	if isPrefix {
+		// The command line exceeds the reader buffer; drain the remainder then reject.
+		for isPrefix {
+			_, isPrefix, err = s.br.ReadLine()
+			if err != nil {
+				return "", err
+			}
+		}
+		return "", errLineTooLong
+	}
+
+	line := strings.TrimSpace(string(lineBytes))
 
 	if Debug {
 		verb := "READ"
@@ -826,14 +917,14 @@ func (s *session) readLine() (string, error) {
 		}
 	}
 
-	return line, err
+	return line, nil
 }
 
 // Parse a line read from the socket.
 func (s *session) parseLine(line string) (verb string, args string) {
-	if idx := strings.Index(line, " "); idx != -1 {
-		verb = strings.ToUpper(line[:idx])
-		args = strings.TrimSpace(line[idx+1:])
+	if before, after, ok := strings.Cut(line, " "); ok {
+		verb = strings.ToUpper(before)
+		args = strings.TrimSpace(after)
 	} else {
 		verb = strings.ToUpper(line)
 		args = ""
@@ -849,9 +940,24 @@ func (s *session) readData() ([]byte, error) {
 			_ = s.conn.SetReadDeadline(time.Now().Add(s.srv.Timeout))
 		}
 
-		line, err := s.br.ReadBytes('\n')
-		if err != nil {
-			return nil, err
+		// Read the line in buffer-sized chunks. On ErrBufferFull (no newline
+		// found yet) enforce MaxSize early so a single long line cannot force
+		// allocation of the whole over-limit payload before rejection.
+		var line []byte
+		for {
+			fragment, err := s.br.ReadSlice('\n')
+			line = append(line, fragment...)
+			if err == nil {
+				break // newline found, line is complete
+			}
+			if err != bufio.ErrBufferFull {
+				return nil, err
+			}
+			// Buffer filled without a newline - check now before reading more.
+			if s.srv.MaxSize > 0 && len(data)+len(line) > s.srv.MaxSize {
+				s.drainData(false) // mid-line: buffer full without newline
+				return nil, maxSizeExceeded(s.srv.MaxSize)
+			}
 		}
 		// Handle end of data denoted by lone period (\r\n.\r\n)
 		if bytes.Equal(line, []byte(".\r\n")) {
@@ -861,13 +967,10 @@ func (s *session) readData() ([]byte, error) {
 		if line[0] == '.' {
 			line = line[1:]
 		}
-
-		// Enforce the maximum message size limit.
-		if s.srv.MaxSize > 0 {
-			if len(data)+len(line) > s.srv.MaxSize {
-				_, _ = s.br.Discard(s.br.Buffered()) // Discard the buffer remnants.
-				return nil, maxSizeExceeded(s.srv.MaxSize)
-			}
+		// Precise size check against the completed, dot-removed line.
+		if s.srv.MaxSize > 0 && len(data)+len(line) > s.srv.MaxSize {
+			s.drainData(true) // line was complete (ended with \n)
+			return nil, maxSizeExceeded(s.srv.MaxSize)
 		}
 
 		data = append(data, line...)
@@ -875,14 +978,41 @@ func (s *session) readData() ([]byte, error) {
 	return data, nil
 }
 
+// drainData reads and discards the remainder of a DATA stream up to
+// the \r\n.\r\n terminator. This prevents protocol desynchronisation
+// when rejecting an oversized message: without draining, leftover body
+// lines would be misinterpreted as SMTP commands on the next read.
+func (s *session) drainData(atLineStart bool) {
+	for {
+		if s.srv.Timeout > 0 {
+			_ = s.conn.SetReadDeadline(time.Now().Add(s.srv.Timeout))
+		}
+		line, err := s.br.ReadSlice('\n')
+		if err != nil && err != bufio.ErrBufferFull {
+			return // connection error or EOF; caller will handle
+		}
+		if atLineStart && bytes.Equal(line, []byte(".\r\n")) {
+			return
+		}
+		// A fragment ending with \n completes the logical line;
+		// the next fragment will be the start of a new line.
+		// ErrBufferFull means we're still mid-line.
+		atLineStart = err == nil
+	}
+}
+
 // Create the Received header to comply with RFC 2821 section 3.8.2.
 // TODO: Work out what to do with multiple to addresses.
 func (s *session) makeHeaders(to []string) []byte {
 	var buffer bytes.Buffer
+	if len(to) == 0 {
+		return buffer.Bytes()
+	}
+
 	now := time.Now().Format("Mon, 2 Jan 2006 15:04:05 -0700 (MST)")
-	buffer.WriteString(fmt.Sprintf("Received: from %s (%s [%s])\r\n", s.remoteName, s.remoteHost, s.remoteIP))
-	buffer.WriteString(fmt.Sprintf("        by %s (%s) with SMTP\r\n", s.srv.Hostname, s.srv.AppName))
-	buffer.WriteString(fmt.Sprintf("        for <%s>; %s\r\n", to[0], now))
+	fmt.Fprintf(&buffer, "Received: from %s (%s [%s])\r\n", s.remoteName, s.remoteHost, s.remoteIP)
+	fmt.Fprintf(&buffer, "        by %s (%s) with SMTP\r\n", s.srv.Hostname, s.srv.AppName)
+	fmt.Fprintf(&buffer, "        for <%s>; %s\r\n", to[0], now)
 	return buffer.Bytes()
 }
 
@@ -928,6 +1058,10 @@ func (s *session) makeEHLOResponse() (response string) {
 	}
 
 	response += "250-ENHANCEDSTATUSCODES\r\n"
+	// RFC 6531 specifies that the presence of SMTPUTF8 should include 8BITMIME
+	// "Servers offering this extension MUST provide support for, and announce, the 8BITMIME extension"
+	// https://www.rfc-editor.org/rfc/rfc6531#section-3.1:
+	response += "250-8BITMIME\r\n"
 	response += "250 SMTPUTF8" // last entry must use a space instead of a dash
 	return
 }
@@ -1043,7 +1177,10 @@ func extractAndValidateAddress(re *regexp.Regexp, args string) ([]string, error)
 		return nil, nil
 	}
 
-	if strings.Contains(match[1], " ") {
+	// RFC 5321 §4.1.2 permits SP inside a quoted local-part, so reject only
+	// whitespace that appears outside a quoted-string. mail.ParseAddress
+	// below still rejects CR/LF/NUL (see GHSA-54wq-72mp-cq7c).
+	if hasUnquotedWhitespace(match[1]) {
 		return nil, errors.New("553 5.1.3 The address is not a valid RFC 5321 address")
 	}
 
@@ -1065,4 +1202,58 @@ func extractAndValidateAddress(re *regexp.Regexp, args string) ([]string, error)
 	}
 
 	return match, nil
+}
+
+// hasUnquotedWhitespace reports whether s contains a space or tab that is not
+// enclosed in a quoted-string. Backslash escapes inside a quoted-string are
+// honoured so that a quoted-pair does not prematurely close the quote.
+func hasUnquotedWhitespace(s string) bool {
+	inQuotes := false
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		switch c {
+		case '\\':
+			if inQuotes {
+				escaped = true
+			}
+		case '"':
+			inQuotes = !inQuotes
+		case ' ', '\t':
+			if !inQuotes {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isValidAuthParam validates an AUTH parameter value per RFC 4954 and RFC 3461 (xtext).
+func isValidAuthParam(val string) bool {
+	if val == "<>" {
+		return true
+	}
+	if len(val) == 0 {
+		return false
+	}
+	for i := 0; i < len(val); i++ {
+		c := val[i]
+		if c == '+' {
+			if i+2 >= len(val) || !isHex(val[i+1]) || !isHex(val[i+2]) {
+				return false
+			}
+			i += 2
+		} else if c < 33 || c > 126 || c == '=' {
+			return false
+		}
+	}
+	return true
+}
+
+func isHex(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }

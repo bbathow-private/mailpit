@@ -80,17 +80,25 @@ func Search(search, timezone string, start int, beforeTS int64, limit int) ([]Me
 	nrResults = len(allResults)
 
 	if nrResults > start {
-		end := nrResults
-		if nrResults >= start+limit {
-			end = start + limit
-		}
+		end := min(nrResults, start+limit)
 
 		results = allResults[start:end]
 	}
 
 	// set tags for listed messages only
-	for i, m := range results {
-		results[i].Tags = getMessageTags(m.ID)
+	if len(results) > 0 {
+		ids := make([]string, len(results))
+		for i, m := range results {
+			ids[i] = m.ID
+		}
+		tagMap := getTagsForIDs(ids)
+		for i, m := range results {
+			if tags, ok := tagMap[m.ID]; ok {
+				results[i].Tags = tags
+			} else {
+				results[i].Tags = []string{}
+			}
+		}
 	}
 
 	elapsed := time.Since(tsStart)
@@ -196,7 +204,7 @@ func DeleteSearch(search, timezone string) error {
 		defer func() { _ = tx.Rollback() }()
 
 		for _, ids := range chunks {
-			delIDs := make([]interface{}, len(ids))
+			delIDs := make([]any, len(ids))
 			for i, id := range ids {
 				delIDs[i] = id
 			}
@@ -303,12 +311,12 @@ func searchQueryBuilder(searchString, timezone string) *sqlf.Stmt {
 	// group strings with quotes as a single argument and remove quotes
 	args := tools.ArgsParser(searchString)
 
+	loc := time.Local
 	if timezone != "" {
-		loc, err := time.LoadLocation(timezone)
-		if err != nil {
+		if l, err := time.LoadLocation(timezone); err != nil {
 			logger.Log().Warnf("ignoring invalid timezone:\"%s\"", timezone)
 		} else {
-			time.Local = loc
+			loc = l
 		}
 	}
 
@@ -348,73 +356,73 @@ func searchQueryBuilder(searchString, timezone string) *sqlf.Stmt {
 			w = cleanString(w[3:])
 			if w != "" {
 				if exclude {
-					q.Where("ToJSON NOT LIKE ?", "%"+escPercentChar(w)+"%")
+					q.Where("ToJSON NOT LIKE ? ESCAPE '\\'", "%"+escLikeChars(escJSONChars(w))+"%")
 				} else {
-					q.Where("ToJSON LIKE ?", "%"+escPercentChar(w)+"%")
+					q.Where("ToJSON LIKE ? ESCAPE '\\'", "%"+escLikeChars(escJSONChars(w))+"%")
 				}
 			}
 		} else if strings.HasPrefix(lw, "from:") {
 			w = cleanString(w[5:])
 			if w != "" {
 				if exclude {
-					q.Where("FromJSON NOT LIKE ?", "%"+escPercentChar(w)+"%")
+					q.Where("FromJSON NOT LIKE ? ESCAPE '\\'", "%"+escLikeChars(escJSONChars(w))+"%")
 				} else {
-					q.Where("FromJSON LIKE ?", "%"+escPercentChar(w)+"%")
+					q.Where("FromJSON LIKE ? ESCAPE '\\'", "%"+escLikeChars(escJSONChars(w))+"%")
 				}
 			}
 		} else if strings.HasPrefix(lw, "cc:") {
 			w = cleanString(w[3:])
 			if w != "" {
 				if exclude {
-					q.Where("CcJSON NOT LIKE ?", "%"+escPercentChar(w)+"%")
+					q.Where("CcJSON NOT LIKE ? ESCAPE '\\'", "%"+escLikeChars(escJSONChars(w))+"%")
 				} else {
-					q.Where("CcJSON LIKE ?", "%"+escPercentChar(w)+"%")
+					q.Where("CcJSON LIKE ? ESCAPE '\\'", "%"+escLikeChars(escJSONChars(w))+"%")
 				}
 			}
 		} else if strings.HasPrefix(lw, "bcc:") {
 			w = cleanString(w[4:])
 			if w != "" {
 				if exclude {
-					q.Where("BccJSON NOT LIKE ?", "%"+escPercentChar(w)+"%")
+					q.Where("BccJSON NOT LIKE ? ESCAPE '\\'", "%"+escLikeChars(escJSONChars(w))+"%")
 				} else {
-					q.Where("BccJSON LIKE ?", "%"+escPercentChar(w)+"%")
+					q.Where("BccJSON LIKE ? ESCAPE '\\'", "%"+escLikeChars(escJSONChars(w))+"%")
 				}
 			}
 		} else if strings.HasPrefix(lw, "reply-to:") {
 			w = cleanString(w[9:])
 			if w != "" {
 				if exclude {
-					q.Where("ReplyToJSON NOT LIKE ?", "%"+escPercentChar(w)+"%")
+					q.Where("ReplyToJSON NOT LIKE ? ESCAPE '\\'", "%"+escLikeChars(escJSONChars(w))+"%")
 				} else {
-					q.Where("ReplyToJSON LIKE ?", "%"+escPercentChar(w)+"%")
+					q.Where("ReplyToJSON LIKE ? ESCAPE '\\'", "%"+escLikeChars(escJSONChars(w))+"%")
 				}
 			}
 		} else if strings.HasPrefix(lw, "addressed:") {
 			w = cleanString(w[10:])
-			arg := "%" + escPercentChar(w) + "%"
+			arg := "%" + escLikeChars(escJSONChars(w)) + "%"
 			if w != "" {
 				if exclude {
-					q.Where("(ToJSON NOT LIKE ? AND FromJSON NOT LIKE ? AND CcJSON NOT LIKE ? AND BccJSON NOT LIKE ? AND ReplyToJSON NOT LIKE ?)", arg, arg, arg, arg, arg)
+					q.Where("(ToJSON NOT LIKE ? ESCAPE '\\' AND FromJSON NOT LIKE ? ESCAPE '\\' AND CcJSON NOT LIKE ? ESCAPE '\\' AND BccJSON NOT LIKE ? ESCAPE '\\' AND ReplyToJSON NOT LIKE ? ESCAPE '\\')", arg, arg, arg, arg, arg)
 				} else {
-					q.Where("(ToJSON LIKE ? OR FromJSON LIKE ? OR CcJSON LIKE ? OR BccJSON LIKE ? OR ReplyToJSON LIKE ?)", arg, arg, arg, arg, arg)
+					q.Where("(ToJSON LIKE ? ESCAPE '\\' OR FromJSON LIKE ? ESCAPE '\\' OR CcJSON LIKE ? ESCAPE '\\' OR BccJSON LIKE ? ESCAPE '\\' OR ReplyToJSON LIKE ? ESCAPE '\\')", arg, arg, arg, arg, arg)
 				}
 			}
 		} else if strings.HasPrefix(lw, "subject:") {
 			w = w[8:]
 			if w != "" {
 				if exclude {
-					q.Where("Subject NOT LIKE ?", "%"+escPercentChar(w)+"%")
+					q.Where("Subject NOT LIKE ? ESCAPE '\\'", "%"+escLikeChars(w)+"%")
 				} else {
-					q.Where("Subject LIKE ?", "%"+escPercentChar(w)+"%")
+					q.Where("Subject LIKE ? ESCAPE '\\'", "%"+escLikeChars(w)+"%")
 				}
 			}
 		} else if strings.HasPrefix(lw, "message-id:") {
 			w = cleanString(w[11:])
 			if w != "" {
 				if exclude {
-					q.Where("MessageID NOT LIKE ?", "%"+escPercentChar(w)+"%")
+					q.Where("MessageID NOT LIKE ? ESCAPE '\\'", "%"+escLikeChars(w)+"%")
 				} else {
-					q.Where("MessageID LIKE ?", "%"+escPercentChar(w)+"%")
+					q.Where("MessageID LIKE ? ESCAPE '\\'", "%"+escLikeChars(w)+"%")
 				}
 			}
 		} else if strings.HasPrefix(lw, "tag:") {
@@ -440,9 +448,9 @@ func searchQueryBuilder(searchString, timezone string) *sqlf.Stmt {
 			}
 		} else if lw == "is:tagged" {
 			if exclude {
-				q.Where(`m.ID NOT IN (SELECT DISTINCT mt.ID FROM ` + tenant("message_tags") + ` mt JOIN tags t ON mt.TagID = t.ID)`)
+				q.Where(`m.ID NOT IN (SELECT DISTINCT mt.ID FROM ` + tenant("message_tags") + ` mt JOIN ` + tenant("tags") + ` t ON mt.TagID = t.ID)`)
 			} else {
-				q.Where(`m.ID IN (SELECT DISTINCT mt.ID FROM ` + tenant("message_tags") + ` mt JOIN tags t ON mt.TagID = t.ID)`)
+				q.Where(`m.ID IN (SELECT DISTINCT mt.ID FROM ` + tenant("message_tags") + ` mt JOIN ` + tenant("tags") + ` t ON mt.TagID = t.ID)`)
 			}
 		} else if lw == "has:inline" || lw == "has:inlines" {
 			if exclude {
@@ -457,9 +465,9 @@ func searchQueryBuilder(searchString, timezone string) *sqlf.Stmt {
 				q.Where("Attachments > 0")
 			}
 		} else if strings.HasPrefix(lw, "after:") {
-			w = cleanString(w[6:])
+			w = strings.ToUpper(cleanString(w[6:]))
 			if w != "" {
-				t, err := dateparse.ParseLocal(w)
+				t, err := dateparse.ParseIn(w, loc)
 				if err != nil {
 					logger.Log().Warnf("ignoring invalid after: date \"%s\"", w)
 				} else {
@@ -472,9 +480,9 @@ func searchQueryBuilder(searchString, timezone string) *sqlf.Stmt {
 				}
 			}
 		} else if strings.HasPrefix(lw, "before:") {
-			w = cleanString(w[7:])
+			w = strings.ToUpper(cleanString(w[7:]))
 			if w != "" {
-				t, err := dateparse.ParseLocal(w)
+				t, err := dateparse.ParseIn(w, loc)
 				if err != nil {
 					logger.Log().Warnf("ignoring invalid before: date \"%s\"", w)
 				} else {
@@ -505,9 +513,9 @@ func searchQueryBuilder(searchString, timezone string) *sqlf.Stmt {
 		} else {
 			// search text
 			if exclude {
-				q.Where("SearchText NOT LIKE ?", "%"+cleanString(escPercentChar(strings.ToLower(w)))+"%")
+				q.Where("SearchText NOT LIKE ? ESCAPE '\\'", "%"+escLikeChars(cleanString(w))+"%")
 			} else {
-				q.Where("SearchText LIKE ?", "%"+cleanString(escPercentChar(strings.ToLower(w)))+"%")
+				q.Where("SearchText LIKE ? ESCAPE '\\'", "%"+escLikeChars(cleanString(w))+"%")
 			}
 		}
 	}

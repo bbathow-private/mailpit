@@ -11,9 +11,9 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/axllent/mailpit/internal/shortuuid"
 	"github.com/goccy/go-yaml"
 	"github.com/jhillyerd/enmime/v2"
-	"github.com/lithammer/shortuuid/v4"
 )
 
 var (

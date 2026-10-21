@@ -28,7 +28,7 @@ var (
 	}
 
 	// Shared test message structure for consistency
-	testSendMessage = map[string]interface{}{
+	testSendMessage = map[string]any{
 		"From": map[string]string{
 			"Email": "test@example.com",
 		},
@@ -92,8 +92,38 @@ func TestAPIv1Messages(t *testing.T) {
 	// 10 should be marked as read
 	assertStatsEqual(t, ts.URL+"/api/v1/messages", 90, 100)
 
-	// delete all
-	t.Log("Delete all messages")
+	// delete specific messages with duplicate IDs
+	t.Log("Delete messages with duplicate IDs")
+	firstID := m.Messages[0].ID
+	deleteData := struct {
+		IDs []string
+	}{
+		IDs: []string{firstID, firstID},
+	}
+	j, err := json.Marshal(deleteData)
+	if err != nil {
+		t.Error(err.Error())
+	}
+	_, err = clientDelete(ts.URL+"/api/v1/messages", string(j))
+	if err != nil {
+		t.Errorf("Expected nil, received %s", err.Error())
+	}
+	assertStatsEqual(t, ts.URL+"/api/v1/messages", 90, 99)
+
+	// delete with empty IDs should delete all
+	t.Log("Delete with empty IDs (delete all)")
+	_, err = clientDelete(ts.URL+"/api/v1/messages", `{"IDs":[]}`)
+	if err != nil {
+		t.Errorf("Expected nil, received %s", err.Error())
+	}
+	assertStatsEqual(t, ts.URL+"/api/v1/messages", 0, 0)
+
+	// re-insert and delete all with no body
+	t.Log("Re-insert 100 messages")
+	insertEmailData(t)
+	assertStatsEqual(t, ts.URL+"/api/v1/messages", 100, 100)
+
+	t.Log("Delete all messages with empty body")
 	_, err = clientDelete(ts.URL+"/api/v1/messages", "{}")
 	if err != nil {
 		t.Errorf("Expected nil, received %s", err.Error())
@@ -169,7 +199,35 @@ func TestAPIv1ToggleReadStatus(t *testing.T) {
 	}
 	assertStatsEqual(t, ts.URL+"/api/v1/messages", 100, 100)
 
-	// mark all as read
+	// mark read with duplicate IDs
+	t.Log("Mark read with duplicate IDs")
+	putData.Read = true
+	putData.IDs = []string{putIDs[0], putIDs[0]}
+	j, err = json.Marshal(putData)
+	if err != nil {
+		t.Error(err.Error())
+	}
+	_, err = clientPut(ts.URL+"/api/v1/messages", string(j))
+	if err != nil {
+		t.Error(err.Error())
+	}
+	assertStatsEqual(t, ts.URL+"/api/v1/messages", 99, 100)
+
+	// mark unread with duplicate IDs
+	t.Log("Mark unread with duplicate IDs")
+	putData.Read = false
+	putData.IDs = []string{putIDs[0], putIDs[0]}
+	j, err = json.Marshal(putData)
+	if err != nil {
+		t.Error(err.Error())
+	}
+	_, err = clientPut(ts.URL+"/api/v1/messages", string(j))
+	if err != nil {
+		t.Error(err.Error())
+	}
+	assertStatsEqual(t, ts.URL+"/api/v1/messages", 100, 100)
+
+	// mark all as read with empty IDs
 	putData.Read = true
 	putData.IDs = []string{}
 	j, err = json.Marshal(putData)
@@ -326,6 +384,97 @@ func TestAPIv1Send(t *testing.T) {
 		t.Error(err.Error())
 	}
 	assertEqual(t, `This is a plain text attachment`, string(attachmentBytes), "wrong Attachment content")
+}
+
+func TestAPIv1SendInvalidHeaders(t *testing.T) {
+	setup()
+	defer storage.Close()
+
+	r := apiRoutes()
+
+	ts := httptest.NewServer(r)
+	defer ts.Close()
+
+	sendWithHeader := func(key string) error {
+		payload := fmt.Sprintf(`{
+			"From": {"Email": "test@example.com"},
+			"To": [{"Email": "recipient@example.com"}],
+			"Subject": "Test",
+			"Text": "Body",
+			"Headers": {%q: "value"}
+		}`, key)
+		_, err := clientPost(ts.URL+"/api/v1/send", payload)
+		return err
+	}
+
+	// Valid header keys should be accepted
+	for _, key := range []string{"X-Custom", "X-IP", "X-My-Header-123"} {
+		if err := sendWithHeader(key); err != nil {
+			t.Errorf("Expected valid header key %q to be accepted, got: %s", key, err)
+		}
+	}
+
+	// Invalid header keys should be rejected
+	for _, key := range []string{
+		"X-Custom\r\nSender: evil@example.com\r\nX-End",               // CRLF injection
+		"X-Custom: custom-value\r\nSender: evil@example.com\r\nX-End", // CRLF injection
+		"X Custom",    // space (byte 32)
+		"X\tCustom",   // tab (byte 9)
+		"X:Custom",    // colon
+		"",            // empty
+		"X-Head\x00r", // null byte
+	} {
+		if err := sendWithHeader(key); err == nil {
+			t.Errorf("Expected invalid header key %q to be rejected", key)
+		}
+	}
+}
+
+func TestAPIv1SendMaxMessageSize(t *testing.T) {
+	setup()
+	defer storage.Close()
+
+	r := apiRoutes()
+
+	ts := httptest.NewServer(r)
+	defer ts.Close()
+
+	original := config.MaxMessageSize
+	defer func() { config.MaxMessageSize = original }()
+
+	config.MaxMessageSize = 1 // 1 MiB cap for the test
+
+	bigText := strings.Repeat("X", 2*1024*1024)
+	oversized := fmt.Sprintf(`{
+		"From": {"Email": "a@example.com"},
+		"To": [{"Email": "b@example.com"}],
+		"Subject": "oversize",
+		"Text": %q
+	}`, bigText)
+
+	t.Log("Sending oversize message via HTTP API (expect 413)")
+	req, err := http.NewRequest("POST", ts.URL+"/api/v1/send", strings.NewReader(oversized))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("unexpected transport error: %s", err)
+	}
+	_ = resp.Body.Close()
+	assertEqual(t, http.StatusRequestEntityTooLarge, resp.StatusCode, "expected 413 for oversize body")
+
+	t.Log("Sending normal-sized message via HTTP API (expect 200)")
+	jsonData, _ := json.Marshal(testSendMessage)
+	if _, err := clientPost(ts.URL+"/api/v1/send", string(jsonData)); err != nil {
+		t.Errorf("expected success for in-bound payload, got: %s", err)
+	}
+
+	t.Log("Setting MaxMessageSize=0 (unlimited), oversize should now succeed")
+	config.MaxMessageSize = 0
+	if _, err := clientPost(ts.URL+"/api/v1/send", oversized); err != nil {
+		t.Errorf("expected success when MaxMessageSize=0, got: %s", err)
+	}
 }
 
 func TestSendAPIAuthMiddleware(t *testing.T) {
@@ -492,6 +641,87 @@ func TestSendAPIAuthMiddleware(t *testing.T) {
 	})
 }
 
+func TestAPIv1QuotedLocalPartStore(t *testing.T) {
+	setup()
+	defer storage.Close()
+
+	r := apiRoutes()
+	ts := httptest.NewServer(r)
+	defer ts.Close()
+
+	// Store a raw message with quoted local-parts in the headers.
+	// This simulates what arrives via SMTP for addresses like "odd user"@example.com.
+	raw := []byte("From: <\"odd user\"@example.com>\r\nTo: <\"a@b\"@example.com>\r\nSubject: Quoted local-part test\r\nMIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nTest body\r\n")
+	id, err := storage.Store(&raw, nil)
+	if err != nil {
+		t.Fatalf("failed to store message: %s", err)
+	}
+
+	// Fetch the individual message via the API
+	msg, err := fetchMessage(ts.URL + "/api/v1/message/" + id)
+	if err != nil {
+		t.Fatalf("failed to fetch message: %s", err)
+	}
+
+	// The Address field must contain a valid, parseable addr-spec with quotes
+	assertEqual(t, `"odd user"@example.com`, msg.From.Address, "From address not re-quoted")
+	assertEqual(t, 1, len(msg.To), "wrong To count")
+	assertEqual(t, `"a@b"@example.com`, msg.To[0].Address, "To address not re-quoted")
+
+	// Also verify the messages list endpoint (reads from stored metadata JSON)
+	m, err := fetchMessages(ts.URL + "/api/v1/messages")
+	if err != nil {
+		t.Fatalf("failed to fetch messages: %s", err)
+	}
+
+	assertEqual(t, uint64(1), m.Total, "wrong total count")
+	assertEqual(t, `"odd user"@example.com`, m.Messages[0].From.Address, "From address in list not re-quoted")
+	assertEqual(t, `"a@b"@example.com`, m.Messages[0].To[0].Address, "To address in list not re-quoted")
+}
+
+func TestAPIv1QuotedLocalPartSend(t *testing.T) {
+	setup()
+	defer storage.Close()
+
+	r := apiRoutes()
+	ts := httptest.NewServer(r)
+	defer ts.Close()
+
+	jsonData := `{
+		"From": {
+			"Email": "\"odd user\"@example.com"
+		},
+		"To": [
+			{
+				"Email": "\"a@b\"@example.com",
+				"Name": "Quoted Recipient"
+			}
+		],
+		"Subject": "Quoted local-part via Send API",
+		"Text": "Test body"
+	}`
+
+	b, err := clientPost(ts.URL+"/api/v1/send", jsonData)
+	if err != nil {
+		t.Fatalf("send failed: %s", err)
+	}
+
+	resp := struct{ ID string }{}
+	if err := json.Unmarshal(b, &resp); err != nil {
+		t.Fatalf("failed to parse send response: %s", err)
+	}
+
+	msg, err := fetchMessage(ts.URL + "/api/v1/message/" + resp.ID)
+	if err != nil {
+		t.Fatalf("failed to fetch message: %s", err)
+	}
+
+	assertEqual(t, `"odd user"@example.com`, msg.From.Address, "From address not re-quoted")
+	assertEqual(t, 1, len(msg.To), "wrong To count")
+	assertEqual(t, `"a@b"@example.com`, msg.To[0].Address, "To address not re-quoted")
+	assertEqual(t, "Quoted Recipient", msg.To[0].Name, "To name lost")
+}
+
 func setup() {
 	logger.NoLogging = true
 	config.MaxMessages = 0
@@ -545,11 +775,11 @@ func assertSearchEqual(t *testing.T, uri, query string, count int) {
 }
 
 func insertEmailData(t *testing.T) {
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		msg := enmime.Builder().
 			From(fmt.Sprintf("From %d", i), fmt.Sprintf("from-%d@example.com", i)).
 			Subject(fmt.Sprintf("Subject line %d end", i)).
-			Text([]byte(fmt.Sprintf("This is the email body %d <jdsauk;dwqmdqw;>.", i))).
+			Text(fmt.Appendf(nil, "This is the email body %d <jdsauk;dwqmdqw;>.", i)).
 			To(fmt.Sprintf("To %d", i), fmt.Sprintf("to-%d@example.com", i))
 
 		env, err := msg.Build()
@@ -754,7 +984,7 @@ func clientGetWithAuth(url, username, password string) ([]byte, error) {
 	return data, err
 }
 
-func assertEqual(t *testing.T, a interface{}, b interface{}, message string) {
+func assertEqual(t *testing.T, a any, b any, message string) {
 	if a == b {
 		return
 	}

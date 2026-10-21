@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"encoding/json"
 	"net/mail"
 	"os"
 	"regexp"
@@ -18,6 +19,12 @@ var (
 	mu sync.RWMutex
 	// StatsDeleted for counting the number of messages deleted
 	StatsDeleted uint64
+
+	// cleanStringRe is used to remove unwanted characters from stored search text and search queries
+	cleanStringRe = regexp.MustCompile(`(\r?\n|\t|>|<|"|\,|;|\(|\))`)
+
+	// envelopeParser is a shared enmime parser instance used for message parsing
+	envelopeParser = enmime.NewParser(enmime.DisableCharacterDetection(true), enmime.MaxMIMEParts(500))
 )
 
 // AddTempFile adds a file to the slice of files to delete on exit
@@ -41,7 +48,28 @@ func addressToSlice(env *enmime.Envelope, key string) []*mail.Address {
 		return []*mail.Address{}
 	}
 
+	for _, a := range data {
+		normalizeAddress(a)
+	}
+
 	return data
+}
+
+// normalizeAddress re-quotes the local-part of an email address when it
+// contains characters not valid in a dot-atom (RFC 5321 §4.1.2).
+// Go's mail.Address stores the decoded local-part, stripping quotes during
+// parsing; this restores them so the Address field is a valid addr-spec.
+//
+// Rather than reimplementing RFC quoting rules, this delegates to
+// mail.Address.String() which already handles quoting and escaping
+// correctly, then extracts the addr-spec from the angle brackets.
+func normalizeAddress(a *mail.Address) {
+	s := a.String()
+	start := strings.LastIndex(s, "<")
+	end := strings.LastIndex(s, ">")
+	if start >= 0 && end > start {
+		a.Address = s[start+1 : end]
+	}
 }
 
 // Generate the search text based on some header fields (to, from, subject etc)
@@ -49,23 +77,23 @@ func addressToSlice(env *enmime.Envelope, key string) []*mail.Address {
 func createSearchText(env *enmime.Envelope) string {
 	var b strings.Builder
 
-	b.WriteString(env.GetHeader("From") + " ")
-	b.WriteString(env.GetHeader("Subject") + " ")
-	b.WriteString(env.GetHeader("To") + " ")
-	b.WriteString(env.GetHeader("Cc") + " ")
-	b.WriteString(env.GetHeader("Bcc") + " ")
-	b.WriteString(env.GetHeader("Reply-To") + " ")
-	b.WriteString(env.GetHeader("Return-Path") + " ")
+	_, _ = b.WriteString(env.GetHeader("From") + " ")
+	_, _ = b.WriteString(env.GetHeader("Subject") + " ")
+	_, _ = b.WriteString(env.GetHeader("To") + " ")
+	_, _ = b.WriteString(env.GetHeader("Cc") + " ")
+	_, _ = b.WriteString(env.GetHeader("Bcc") + " ")
+	_, _ = b.WriteString(env.GetHeader("Reply-To") + " ")
+	_, _ = b.WriteString(env.GetHeader("Return-Path") + " ")
 
-	h := html2text.Strip(env.HTML, true)
+	h, _ := html2text.Strip(env.HTML, true)
 	if h != "" {
-		b.WriteString(h + " ")
+		_, _ = b.WriteString(h + " ")
 	} else {
-		b.WriteString(env.Text + " ")
+		_, _ = b.WriteString(env.Text + " ")
 	}
 	// add attachment filenames
 	for _, a := range env.Attachments {
-		b.WriteString(a.FileName + " ")
+		_, _ = b.WriteString(a.FileName + " ")
 	}
 
 	d := cleanString(b.String())
@@ -79,8 +107,7 @@ func cleanString(str string) string {
 	str = strings.ReplaceAll(str, string('\uFEFF'), " ")
 
 	// remove/replace new lines
-	re := regexp.MustCompile(`(\r?\n|\t|>|<|"|\,|;|\(|\))`)
-	str = re.ReplaceAllString(str, " ")
+	str = cleanStringRe.ReplaceAllString(str, " ")
 
 	// remove duplicate whitespace and trim
 	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(str)), " "))
@@ -103,7 +130,24 @@ func isFile(path string) bool {
 	return true
 }
 
-// Convert `%` to `%%` for SQL searches
-func escPercentChar(s string) string {
-	return strings.ReplaceAll(s, "%", "%%")
+// likeEscaper escapes the SQL LIKE wildcards `%` and `_` (and the escape character
+// itself) so they match literally. Queries must use `LIKE ? ESCAPE '\'`.
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+// escLikeChars escapes a search term for use in a SQL LIKE pattern
+func escLikeChars(s string) string {
+	return likeEscaper.Replace(s)
+}
+
+// escJSONChars encodes a search term the way encoding/json stores it in the message
+// metadata (eg: `&` as `\u0026` and `\` as `\\`), so it can be matched against
+// the To, From, Cc, Bcc and ReplyTo JSON.
+func escJSONChars(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return s
+	}
+
+	// remove the surrounding quotes
+	return string(b[1 : len(b)-1])
 }

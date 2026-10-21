@@ -47,6 +47,10 @@ var (
 	// @see https://sqlite.org/wal.html
 	DisableWAL bool
 
+	// DisableAutoVACUUM will disable the auto-VACUUM of the local SQLite database when messages
+	// are deleted and a preconfigured threshold is reached.
+	DisableAutoVACUUM bool
+
 	// Compression is the compression level used to store raw messages in the database:
 	// 0 = off, 1 = fastest (default), 2 = standard, 3 = best compression
 	Compression = 1
@@ -122,11 +126,25 @@ var (
 	// however some servers accept more.
 	SMTPMaxRecipients = 100
 
+	// MaxMessageSize is the maximum size of an inbound message, in megabytes (MiB).
+	// Applies to both SMTP DATA payloads and the HTTP /api/v1/send body.
+	// 0 disables the limit (not recommended on network-reachable listeners).
+	MaxMessageSize = 50
+
 	// IgnoreDuplicateIDs will skip messages with the same ID
 	IgnoreDuplicateIDs bool
 
 	// BlockRemoteCSSAndFonts used to disable remote CSS & fonts
 	BlockRemoteCSSAndFonts = false
+
+	// AllowInternalHTTPRequests will allow HTTP requests to internal IP addresses (e.g., loopback, private, link-local, or multicast) when set to true.
+	// This policy applies to both link checking and screenshot generation (proxy) features and is disabled by default for security reasons.
+	AllowInternalHTTPRequests = false
+
+	// DisableLinkCheckRateLimit disables the per-domain rate limiter, concurrency
+	// cap, and result cache used by the link checker. Off by default; set when
+	// running in a trusted environment where the limiter's pacing is unwanted.
+	DisableLinkCheckRateLimit = false
 
 	// CLITagsArg is used to map the CLI args
 	CLITagsArg string
@@ -319,6 +337,10 @@ func VerifyConfig() error {
 	}
 	if _, _, isSocket := tools.UnixSocket(HTTPListen); !isSocket && !re.MatchString(HTTPListen) {
 		return errors.New("[ui] HTTP bind should be in the format of <ip>:<port>")
+	}
+
+	if MaxMessageSize == 0 {
+		logger.Log().Warnf("[smtpd] no message limit set, this is not recommended for network-reachable listeners")
 	}
 
 	// Web UI & API

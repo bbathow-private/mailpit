@@ -8,3 +8,5 @@
 *.old
 *.db
 .mise.toml
+/test-results
+/playwright-report

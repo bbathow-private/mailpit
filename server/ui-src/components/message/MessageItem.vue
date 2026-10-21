@@ -8,6 +8,7 @@ import Tags from "bootstrap5-tags";
 import { Tooltip } from "bootstrap";
 import commonMixins from "../../mixins/CommonMixins";
 import { mailbox } from "../../stores/mailbox";
+import { sanitizeHTML } from "../../utils/sanitize";
 import DOMPurify from "dompurify";
 import hljs from "highlight.js/lib/core";
 import xml from "highlight.js/lib/languages/xml";
@@ -71,45 +72,7 @@ export default {
 
 		// remove bad HTML, JavaScript, iframes etc
 		sanitizedHTML() {
-			// set target & rel on all links
-			DOMPurify.addHook("afterSanitizeAttributes", (node) => {
-				if (
-					node.tagName !== "A" ||
-					(node.hasAttribute("href") && node.getAttribute("href").substring(0, 1) === "#")
-				) {
-					return;
-				}
-				if ("target" in node) {
-					node.setAttribute("target", "_blank");
-					node.setAttribute("rel", "noopener noreferrer");
-				}
-				if (!node.hasAttribute("target") && (node.hasAttribute("xlink:href") || node.hasAttribute("href"))) {
-					node.setAttribute("xlink:show", "_blank");
-				}
-			});
-
-			const clean = DOMPurify.sanitize(this.message.HTML, {
-				WHOLE_DOCUMENT: true,
-				SANITIZE_DOM: false,
-				ADD_TAGS: ["link", "meta", "o:p", "style"],
-				ADD_ATTR: [
-					"bordercolor",
-					"charset",
-					"content",
-					"hspace",
-					"http-equiv",
-					"itemprop",
-					"itemscope",
-					"itemtype",
-					"link",
-					"vertical-align",
-					"vlink",
-					"vspace",
-					"xml:lang",
-				],
-				FORBID_ATTR: ["script"], // all JavaScript should be removed
-				ALLOW_UNKNOWN_PROTOCOLS: true, // allow link href protocols like myapp:// etc
-			});
+			const clean = sanitizeHTML(this.message.HTML);
 
 			// for debugging
 			// this.debugDOMPurify(DOMPurify.removed);
@@ -216,7 +179,7 @@ export default {
 
 		resizeIframe(el) {
 			const i = el.target;
-			if (typeof i.contentWindow.document.body.scrollHeight === "number") {
+			if (i.contentWindow?.document?.body) {
 				i.style.height = i.contentWindow.document.body.scrollHeight + 50 + "px";
 			}
 		},
@@ -226,10 +189,8 @@ export default {
 				return;
 			}
 			const h = document.getElementById("preview-html");
-			if (h) {
-				if (typeof h.contentWindow.document.body.scrollHeight === "number") {
-					h.style.height = h.contentWindow.document.body.scrollHeight + 50 + "px";
-				}
+			if (h?.contentWindow?.document?.body) {
+				h.style.height = h.contentWindow.document.body.scrollHeight + 50 + "px";
 			}
 		},
 
@@ -288,9 +249,12 @@ export default {
 			});
 		},
 
-		// Convert plain text to HTML including anchor links
+		// Convert plain text to HTML including anchor links.
+		// Only <a> tags are permitted in the output (enforced by DOMPurify).
 		textToHTML(s) {
-			let html = s;
+			// Strip the Unicode placeholder characters used below so that attacker-
+			// controlled input cannot pre-inject fake HTML tags via those chars.
+			let html = s.replace(/(˱˱˱|ˠˠˠ|˲˲˲)/gu, "");
 
 			// RFC2396 appendix E states angle brackets are recommended for text/plain emails to
 			// recognize potential spaces in between the URL
@@ -320,7 +284,10 @@ export default {
 				.replace(/˲˲˲/g, ">")
 				.replace(/ˠˠˠ/g, '"');
 
-			return html;
+			return DOMPurify.sanitize(html, {
+				ALLOWED_TAGS: ["a"],
+				ALLOWED_ATTR: ["href", "target", "rel"],
+			});
 		},
 	},
 };
@@ -455,7 +422,7 @@ export default {
 						</tr>
 						<tr class="small">
 							<th>Tags</th>
-							<td>
+							<td data-testid="message-tags">
 								<select
 									v-model="messageTags"
 									class="form-select small tag-selector"
@@ -726,7 +693,7 @@ export default {
 				aria-selected="false"
 			>
 				Link Check
-				<i v-if="linkCheckErrors === 0" class="bi bi-check-all text-success"></i>
+				<i v-if="linkCheckErrors === 0" class="bi bi-check-all text-success" data-testid="link-check-ok"></i>
 				<span v-else-if="linkCheckErrors > 0" class="badge rounded-pill bg-danger">
 					<small>{{ formatNumber(linkCheckErrors) }}</small>
 				</span>
@@ -779,6 +746,7 @@ export default {
 						:srcdoc="sanitizedHTML"
 						frameborder="0"
 						style="width: 100%; height: 100%; background: #fff"
+						sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
 						@load="resizeIframe"
 					>
 					</iframe>
