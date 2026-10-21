@@ -12,12 +12,12 @@ import (
 	"github.com/axllent/mailpit/config"
 	"github.com/axllent/mailpit/internal/auth"
 	"github.com/axllent/mailpit/internal/logger"
+	"github.com/axllent/mailpit/internal/shortuuid"
 	"github.com/axllent/mailpit/internal/smtpd/bouncerules"
 	"github.com/axllent/mailpit/internal/stats"
 	"github.com/axllent/mailpit/internal/storage"
 	"github.com/axllent/mailpit/internal/tools"
 	"github.com/axllent/mailpit/server/websockets"
-	"github.com/lithammer/shortuuid/v4"
 	"github.com/pkg/errors"
 )
 
@@ -254,6 +254,10 @@ func listenAndServe(addr string, handler MsgIDHandler, authHandler AuthHandler) 
 				logger.Log().Debugf("[smtpd] %s (%s) %s", verbLogTranslator(verb), remoteIP, line)
 			}
 		},
+	}
+
+	if config.MaxMessageSize > 0 {
+		srv.MaxSize = config.MaxMessageSize * 1024 * 1024
 	}
 
 	if config.Label != "" {

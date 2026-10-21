@@ -87,11 +87,13 @@ func init() {
 	rootCmd.Flags().StringVarP(&config.Database, "database", "d", config.Database, "Database to store persistent data")
 	rootCmd.Flags().BoolVar(&config.DisableWAL, "disable-wal", config.DisableWAL, "Disable WAL for local database (allows NFS mounted DBs)")
 	rootCmd.Flags().BoolVar(&config.DisableVersionCheck, "disable-version-check", config.DisableVersionCheck, "Disable version update checking")
+	rootCmd.Flags().BoolVar(&config.DisableAutoVACUUM, "disable-auto-vacuum", config.DisableAutoVACUUM, "Disable auto-VACUUM for the database")
 	rootCmd.Flags().IntVar(&config.Compression, "compression", config.Compression, "Compression level to store raw messages (0-3)")
 	rootCmd.Flags().StringVar(&config.Label, "label", config.Label, "Optional label identify this Mailpit instance")
 	rootCmd.Flags().StringVar(&config.TenantID, "tenant-id", config.TenantID, "Database tenant ID to isolate data")
 	rootCmd.Flags().IntVarP(&config.MaxMessages, "max", "m", config.MaxMessages, "Max number of messages to store")
 	rootCmd.Flags().StringVar(&config.MaxAge, "max-age", config.MaxAge, "Max age of messages in either (h)ours or (d)ays (eg: 3d)")
+	rootCmd.Flags().IntVar(&config.MaxMessageSize, "max-message-size", config.MaxMessageSize, "Maximum message size in MB (0 = unlimited)")
 	rootCmd.Flags().BoolVar(&config.UseMessageDates, "use-message-dates", config.UseMessageDates, "Use message dates as the received dates")
 	rootCmd.Flags().BoolVar(&config.IgnoreDuplicateIDs, "ignore-duplicate-ids", config.IgnoreDuplicateIDs, "Ignore duplicate messages (by Message-ID)")
 	rootCmd.Flags().StringVar(&logger.LogFile, "log-file", logger.LogFile, "Log output to file instead of stdout")
@@ -100,12 +102,15 @@ func init() {
 
 	// Web UI / API
 	rootCmd.Flags().StringVarP(&config.HTTPListen, "listen", "l", config.HTTPListen, "HTTP bind interface & port for UI")
+	rootCmd.Flags().StringVar(&server.AllowedHosts, "allowed-hosts", server.AllowedHosts, "Allowlist of Host header values, comma-separated (mitigates DNS rebinding)")
 	rootCmd.Flags().StringVar(&config.Webroot, "webroot", config.Webroot, "Set the webroot for web UI & API")
 	rootCmd.Flags().StringVar(&config.UIAuthFile, "ui-auth-file", config.UIAuthFile, "A password file for web UI & API authentication")
 	rootCmd.Flags().StringVar(&config.UITLSCert, "ui-tls-cert", config.UITLSCert, "TLS certificate for web UI (HTTPS) - requires ui-tls-key")
 	rootCmd.Flags().StringVar(&config.UITLSKey, "ui-tls-key", config.UITLSKey, "TLS key for web UI (HTTPS) - requires ui-tls-cert")
 	rootCmd.Flags().StringVar(&server.AccessControlAllowOrigin, "api-cors", server.AccessControlAllowOrigin, "Set CORS origin(s) for the API, comma-separated (eg: example.com,foo.com)")
 	rootCmd.Flags().BoolVar(&config.BlockRemoteCSSAndFonts, "block-remote-css-and-fonts", config.BlockRemoteCSSAndFonts, "Block access to remote CSS & fonts")
+	rootCmd.Flags().BoolVar(&config.AllowInternalHTTPRequests, "allow-internal-http-requests", config.AllowInternalHTTPRequests, "Allow link checker, HTML checker & screenshots to access internal IP addresses")
+	rootCmd.Flags().BoolVar(&config.DisableLinkCheckRateLimit, "disable-link-check-rate-limit", config.DisableLinkCheckRateLimit, "Disable the per-domain rate limiter and result cache used by the link checker")
 	rootCmd.Flags().StringVar(&config.EnableSpamAssassin, "enable-spamassassin", config.EnableSpamAssassin, "Enable integration with SpamAssassin")
 	rootCmd.Flags().BoolVar(&config.AllowUntrustedTLS, "allow-untrusted-tls", config.AllowUntrustedTLS, "Do not verify HTTPS certificates (link checker & screenshots)")
 	rootCmd.Flags().BoolVar(&config.DisableHTTPCompression, "disable-http-compression", config.DisableHTTPCompression, "Disable HTTP compression support (web UI & API)")
@@ -206,6 +211,8 @@ func initConfigFromEnv() {
 
 	config.DisableVersionCheck = getEnabledFromEnv("MP_DISABLE_VERSION_CHECK")
 
+	config.DisableAutoVACUUM = getEnabledFromEnv("MP_DISABLE_AUTO_VACUUM")
+
 	if len(os.Getenv("MP_COMPRESSION")) > 0 {
 		config.Compression, _ = strconv.Atoi(os.Getenv("MP_COMPRESSION"))
 	}
@@ -219,6 +226,9 @@ func initConfigFromEnv() {
 	}
 	if len(os.Getenv("MP_MAX_AGE")) > 0 {
 		config.MaxAge = os.Getenv("MP_MAX_AGE")
+	}
+	if len(os.Getenv("MP_MAX_MESSAGE_SIZE")) > 0 {
+		config.MaxMessageSize, _ = strconv.Atoi(os.Getenv("MP_MAX_MESSAGE_SIZE"))
 	}
 	if getEnabledFromEnv("MP_USE_MESSAGE_DATES") {
 		config.UseMessageDates = true
@@ -240,6 +250,9 @@ func initConfigFromEnv() {
 	if len(os.Getenv("MP_UI_BIND_ADDR")) > 0 {
 		config.HTTPListen = os.Getenv("MP_UI_BIND_ADDR")
 	}
+	if len(os.Getenv("MP_ALLOWED_HOSTS")) > 0 {
+		server.AllowedHosts = os.Getenv("MP_ALLOWED_HOSTS")
+	}
 	if len(os.Getenv("MP_WEBROOT")) > 0 {
 		config.Webroot = os.Getenv("MP_WEBROOT")
 	}
@@ -254,6 +267,12 @@ func initConfigFromEnv() {
 	}
 	if getEnabledFromEnv("MP_BLOCK_REMOTE_CSS_AND_FONTS") {
 		config.BlockRemoteCSSAndFonts = true
+	}
+	if getEnabledFromEnv("MP_ALLOW_INTERNAL_HTTP_REQUESTS") {
+		config.AllowInternalHTTPRequests = true
+	}
+	if getEnabledFromEnv("MP_DISABLE_LINK_CHECK_RATE_LIMIT") {
+		config.DisableLinkCheckRateLimit = true
 	}
 	if len(os.Getenv("MP_ENABLE_SPAMASSASSIN")) > 0 {
 		config.EnableSpamAssassin = os.Getenv("MP_ENABLE_SPAMASSASSIN")

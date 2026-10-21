@@ -6,9 +6,11 @@ COPY . /app
 
 WORKDIR /app
 
-RUN  apk upgrade && apk add git npm && \
-npm install && npm run package && \
-CGO_ENABLED=0 go build -ldflags "-s -w -X github.com/axllent/mailpit/config.Version=${VERSION}" -o /mailpit
+RUN apk upgrade && apk add git npm && \
+    npm ci && npm run package && \
+    go install github.com/google/go-licenses/v2@v2.0.1 && \
+    go-licenses report ./... --template .github/third-party-licenses.tpl --ignore github.com/axllent/mailpit > internal/licenses/third-party.txt && \
+    CGO_ENABLED=0 go build -ldflags "-s -w -X github.com/axllent/mailpit/config.Version=${VERSION}" -o /mailpit
 
 FROM alpine:latest
 
@@ -21,7 +23,9 @@ LABEL org.opencontainers.image.title="Mailpit" \
 
 COPY --from=builder /mailpit /mailpit
 
-RUN apk upgrade --no-cache && apk add --no-cache tzdata
+RUN apk upgrade --no-cache && apk add --no-cache tzdata && \
+    ln -sf /mailpit /usr/sbin/sendmail && \
+    ln -sf /mailpit /usr/local/bin/sendmail
 
 EXPOSE 1025/tcp 1110/tcp 8025/tcp
 

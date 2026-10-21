@@ -19,22 +19,20 @@ import (
 
 	"github.com/axllent/mailpit/config"
 	"github.com/axllent/mailpit/internal/logger"
+	"github.com/axllent/mailpit/internal/shortuuid"
 	"github.com/axllent/mailpit/internal/tools"
 	"github.com/axllent/mailpit/server/webhook"
 	"github.com/axllent/mailpit/server/websockets"
 	"github.com/jhillyerd/enmime/v2"
 	"github.com/leporo/sqlf"
-	"github.com/lithammer/shortuuid/v4"
 )
 
 // Store will save an email to the database tables.
 // The username is the authentication username of either the SMTP or HTTP client (blank for none).
 // Returns the database ID of the saved message.
 func Store(body *[]byte, username *string) (string, error) {
-	parser := enmime.NewParser(enmime.DisableCharacterDetection(true))
-
 	// Parse message body with enmime
-	env, err := parser.ReadEnvelope(bytes.NewReader(*body))
+	env, err := envelopeParser.ReadEnvelope(bytes.NewReader(*body))
 	if err != nil {
 		logger.Log().Warnf("[message] %s", err.Error())
 		return "", nil
@@ -166,13 +164,25 @@ func Store(body *[]byte, username *string) (string, error) {
 		}
 	}
 
-	c := &MessageSummary{}
-	if err := json.Unmarshal(summaryJSON, c); err != nil {
-		return "", err
-	}
-
-	// we do not want to to broadcast null values for MetaData else this does not align
+	// Build the summary directly from obj rather than round-tripping through JSON.
+	// We do not want to broadcast null values for metadata else this does not align
 	// with the message summary documented in the API docs, so we set them to empty slices.
+	c := &MessageSummary{
+		Created:     created,
+		ID:          id,
+		MessageID:   messageID,
+		From:        obj.From,
+		To:          obj.To,
+		Cc:          obj.Cc,
+		Bcc:         obj.Bcc,
+		ReplyTo:     obj.ReplyTo,
+		Username:    obj.Username,
+		Subject:     subject,
+		Attachments: attachments,
+		Size:        size,
+		Tags:        setTags,
+		Snippet:     snippet,
+	}
 	if c.From == nil {
 		c.From = &mail.Address{}
 	}
@@ -188,15 +198,6 @@ func Store(body *[]byte, username *string) (string, error) {
 	if c.ReplyTo == nil {
 		c.ReplyTo = []*mail.Address{}
 	}
-
-	c.Created = created
-	c.ID = id
-	c.MessageID = messageID
-	c.Attachments = attachments
-	c.Subject = subject
-	c.Size = size
-	c.Tags = setTags
-	c.Snippet = snippet
 
 	websockets.Broadcast("new", c)
 	webhook.Send(c)
@@ -278,8 +279,19 @@ func List(start int, beforeTS int64, limit int) ([]MessageSummary, error) {
 	}
 
 	// set tags for listed messages only
-	for i, m := range results {
-		results[i].Tags = getMessageTags(m.ID)
+	if len(results) > 0 {
+		ids := make([]string, len(results))
+		for i, m := range results {
+			ids[i] = m.ID
+		}
+		tagMap := getTagsForIDs(ids)
+		for i, m := range results {
+			if tags, ok := tagMap[m.ID]; ok {
+				results[i].Tags = tags
+			} else {
+				results[i].Tags = []string{}
+			}
+		}
 	}
 
 	dbLastAction = time.Now()
@@ -294,16 +306,7 @@ func List(start int, beforeTS int64, limit int) ([]MessageSummary, error) {
 // GetMessage returns a Message generated from the mailbox_data collection.
 // If the message lacks a date header, then the received datetime is used.
 func GetMessage(id string) (*Message, error) {
-	raw, err := GetMessageRaw(id)
-	if err != nil {
-		return nil, err
-	}
-
-	r := bytes.NewReader(raw)
-
-	parser := enmime.NewParser(enmime.DisableCharacterDetection(true))
-
-	env, err := parser.ReadEnvelope(r)
+	env, rawSize, err := getCachedEnvelope(id)
 	if err != nil {
 		return nil, err
 	}
@@ -365,7 +368,7 @@ func GetMessage(id string) (*Message, error) {
 		ReturnPath: returnPath,
 		Subject:    env.GetHeader("Subject"),
 		Tags:       getMessageTags(id),
-		Size:       uint64(len(raw)),
+		Size:       rawSize,
 		Text:       env.Text,
 		Username:   meta.Username,
 	}
@@ -459,16 +462,7 @@ func GetMessageRaw(id string) ([]byte, error) {
 
 // GetAttachmentPart returns an *enmime.Part (attachment or inline) from a message
 func GetAttachmentPart(id, partID string) (*enmime.Part, error) {
-	raw, err := GetMessageRaw(id)
-	if err != nil {
-		return nil, err
-	}
-
-	r := bytes.NewReader(raw)
-
-	parser := enmime.NewParser(enmime.DisableCharacterDetection(true))
-
-	env, err := parser.ReadEnvelope(r)
+	env, _, err := getCachedEnvelope(id)
 	if err != nil {
 		return nil, err
 	}
@@ -548,22 +542,109 @@ func LatestID(r *http.Request) (string, error) {
 
 // MarkRead will mark a message as read
 func MarkRead(ids []string) error {
-	for _, id := range ids {
-		_, err := sqlf.Update(tenant("mailbox")).
-			Set("Read", 1).
-			Where("ID = ?", id).
-			ExecAndClose(context.Background(), db)
+	if len(ids) == 0 {
+		return nil
+	}
 
-		if err == nil {
-			logger.Log().Debugf("[db] marked message %s as read", id)
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	placeholder := `(?` + strings.Repeat(",?", len(ids)-1) + `)`
+
+	// Find which messages are actually unread (will change state)
+	toUpdate := []string{}
+	rows, err := db.Query(fmt.Sprintf(`SELECT ID FROM %s WHERE Read = 0 AND ID IN %s`, tenant("mailbox"), placeholder), args...) // #nosec
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return err
 		}
+		toUpdate = append(toUpdate, id)
+	}
+	_ = rows.Close()
 
-		d := struct {
+	if len(toUpdate) == 0 {
+		return nil
+	}
+
+	updateArgs := make([]any, len(toUpdate))
+	for i, id := range toUpdate {
+		updateArgs[i] = id
+	}
+	updatePlaceholder := `(?` + strings.Repeat(",?", len(toUpdate)-1) + `)`
+
+	if _, err := db.Exec(fmt.Sprintf(`UPDATE %s SET Read = 1 WHERE ID IN %s`, tenant("mailbox"), updatePlaceholder), updateArgs...); err != nil { // #nosec
+		return err
+	}
+
+	for _, id := range toUpdate {
+		logger.Log().Debugf("[db] marked message %s as read", id)
+		websockets.Broadcast("update", struct {
 			ID   string
 			Read bool
-		}{ID: id, Read: true}
+		}{ID: id, Read: true})
+	}
 
-		websockets.Broadcast("update", d)
+	BroadcastMailboxStats()
+
+	return nil
+}
+
+// MarkUnread will mark a message as unread
+func MarkUnread(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	placeholder := `(?` + strings.Repeat(",?", len(ids)-1) + `)`
+
+	// Find which messages are actually read (will change state)
+	toUpdate := []string{}
+	rows, err := db.Query(fmt.Sprintf(`SELECT ID FROM %s WHERE Read = 1 AND ID IN %s`, tenant("mailbox"), placeholder), args...) // #nosec
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		toUpdate = append(toUpdate, id)
+	}
+	_ = rows.Close()
+
+	if len(toUpdate) == 0 {
+		return nil
+	}
+
+	updateArgs := make([]any, len(toUpdate))
+	for i, id := range toUpdate {
+		updateArgs[i] = id
+	}
+	updatePlaceholder := `(?` + strings.Repeat(",?", len(toUpdate)-1) + `)`
+
+	if _, err := db.Exec(fmt.Sprintf(`UPDATE %s SET Read = 0 WHERE ID IN %s`, tenant("mailbox"), updatePlaceholder), updateArgs...); err != nil { // #nosec
+		return err
+	}
+
+	dbLastAction = time.Now()
+
+	for _, id := range toUpdate {
+		logger.Log().Debugf("[db] marked message %s as unread", id)
+		websockets.Broadcast("update", struct {
+			ID   string
+			Read bool
+		}{ID: id, Read: false})
 	}
 
 	BroadcastMailboxStats()
@@ -621,33 +702,6 @@ func MarkAllUnread() error {
 	return nil
 }
 
-// MarkUnread will mark a message as unread
-func MarkUnread(ids []string) error {
-	for _, id := range ids {
-		_, err := sqlf.Update(tenant("mailbox")).
-			Set("Read", 0).
-			Where("ID = ?", id).
-			ExecAndClose(context.Background(), db)
-
-		if err == nil {
-			logger.Log().Debugf("[db] marked message %s as unread", id)
-		}
-
-		dbLastAction = time.Now()
-
-		d := struct {
-			ID   string
-			Read bool
-		}{ID: id, Read: false}
-
-		websockets.Broadcast("update", d)
-	}
-
-	BroadcastMailboxStats()
-
-	return nil
-}
-
 // DeleteMessages deletes one or more messages in bulk
 func DeleteMessages(ids []string) error {
 	if len(ids) == 0 {
@@ -656,7 +710,7 @@ func DeleteMessages(ids []string) error {
 
 	start := time.Now()
 
-	args := make([]interface{}, len(ids))
+	args := make([]any, len(ids))
 	for i, id := range ids {
 		args[i] = id
 	}
@@ -695,8 +749,10 @@ func DeleteMessages(ids []string) error {
 	if err != nil {
 		return err
 	}
+	// roll back if it fails
+	defer func() { _ = tx.Rollback() }()
 
-	args = make([]interface{}, len(toDelete))
+	args = make([]any, len(toDelete))
 	for i, id := range toDelete {
 		args[i] = id
 	}
@@ -704,7 +760,7 @@ func DeleteMessages(ids []string) error {
 	tables := []string{"mailbox", "mailbox_data", "message_tags"}
 
 	for _, t := range tables {
-		sql = fmt.Sprintf(`DELETE FROM %s WHERE ID IN (?%s)`, tenant(t), strings.Repeat(",?", len(ids)-1))
+		sql = fmt.Sprintf(`DELETE FROM %s WHERE ID IN (?%s)`, tenant(t), strings.Repeat(",?", len(toDelete)-1))
 
 		_, err = tx.Exec(sql, args...) // #nosec
 		if err != nil {
@@ -736,6 +792,8 @@ func DeleteMessages(ids []string) error {
 
 	// broadcast individual message deletions
 	for _, id := range toDelete {
+		invalidateEnvelopeCache(id)
+
 		d := struct {
 			ID string
 		}{ID: id}
@@ -794,6 +852,8 @@ func DeleteAllMessages() error {
 	logMessagesDeleted(total)
 
 	BroadcastMailboxStats()
+
+	invalidateAllEnvelopeCache()
 
 	websockets.Broadcast("truncate", nil)
 

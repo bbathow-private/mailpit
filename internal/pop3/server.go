@@ -11,12 +11,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/axllent/mailpit/config"
 	"github.com/axllent/mailpit/internal/auth"
+	"github.com/axllent/mailpit/internal/connlimit"
 	"github.com/axllent/mailpit/internal/logger"
 	"github.com/axllent/mailpit/internal/storage"
 	"github.com/axllent/mailpit/server/websockets"
@@ -66,15 +68,38 @@ func Run() {
 
 	logger.Log().Infof("[pop3] starting on %s", config.POP3Listen)
 
+	serve(listener, connlimit.Max)
+}
+
+// serve accepts connections on the listener, allowing at most maxConns concurrent clients.
+func serve(listener net.Listener, maxConns int) {
+	limiter := connlimit.New("pop3", maxConns)
+
+	var backoff connlimit.Backoff
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			if !connlimit.Retryable(err) {
+				return
+			}
+			// Errors such as running out of file descriptors are temporary
 			logger.Log().Errorf("[pop3] accept error: %s", err.Error())
+			backoff.Wait()
+			continue
+		}
+		backoff.Reset()
+
+		if !limiter.TryAcquire() {
+			connlimit.Refuse(conn, "-ERR Too many connections, please try again later\r\n")
 			continue
 		}
 
 		// run as goroutine
-		go handleClient(conn)
+		go func() {
+			defer limiter.Release()
+			handleClient(conn)
+		}()
 	}
 }
 
@@ -85,10 +110,11 @@ type message struct {
 
 func handleClient(conn net.Conn) {
 	var (
-		user     = ""
-		state    = AUTHORIZATION // Start with AUTHORIZATION state
-		toDelete []string        // Track messages marked for deletion
-		messages []message
+		user         = ""
+		state        = AUTHORIZATION // Start with AUTHORIZATION state
+		toDelete     []string        // Track messages marked for deletion
+		messages     []message
+		failedLogins int
 	)
 
 	defer func() {
@@ -107,7 +133,7 @@ func handleClient(conn net.Conn) {
 		}
 	}()
 
-	reader := bufio.NewReader(conn)
+	reader := bufio.NewReaderSize(conn, 512)
 
 	logger.Log().Debugf("[pop3] connection opened by %s", conn.RemoteAddr().String())
 
@@ -129,7 +155,7 @@ func handleClient(conn net.Conn) {
 		}
 
 		// Reads a line from the client
-		rawLine, err := reader.ReadString('\n')
+		lineBytes, isPrefix, err := reader.ReadLine()
 		if err != nil {
 			if err == io.EOF {
 				logger.Log().Debugf("[pop3] client disconnected: %s", conn.RemoteAddr().String())
@@ -138,12 +164,24 @@ func handleClient(conn net.Conn) {
 			}
 			return
 		}
+		if isPrefix {
+			// Command line exceeds RFC 1939's 255-octet limit; drain and reject.
+			for isPrefix {
+				_, isPrefix, err = reader.ReadLine()
+				if err != nil {
+					return
+				}
+			}
+			sendResponse(conn, "-ERR line too long")
+			continue
+		}
+		rawLine := string(lineBytes)
 
 		// Parses the command
 		cmd, args := getCommand(rawLine)
 		cmd = strings.ToUpper(cmd) // Commands in the POP3 are case-insensitive
 
-		logger.Log().Debugf("[pop3] received: %s (%s)", strings.TrimSpace(rawLine), conn.RemoteAddr().String())
+		logger.Log().Debugf("[pop3] received: %s (%s)", sanitizeLogLine(rawLine), conn.RemoteAddr().String())
 
 		switch cmd {
 		case "CAPA":
@@ -171,12 +209,12 @@ func handleClient(conn net.Conn) {
 					sendResponse(conn, "-ERR must supply a user")
 					return
 				}
-				if len(args) != 1 {
+				if len(args) < 1 {
 					sendResponse(conn, "-ERR must supply a password")
 					return
 				}
 
-				pass := args[0]
+				pass := strings.Join(args, " ")
 				if authUser(user, pass) {
 					sendResponse(conn, "+OK signed in")
 					var err error
@@ -186,8 +224,13 @@ func handleClient(conn net.Conn) {
 					}
 					state = TRANSACTION
 				} else {
+					failedLogins++
 					sendResponse(conn, "-ERR invalid password")
 					logger.Log().Warnf("[pop3] failed login: %s", user)
+					if failedLogins >= 5 {
+						logger.Log().Warnf("[pop3] too many failed logins, disconnecting: %s", conn.RemoteAddr().String())
+						return
+					}
 				}
 			} else {
 				sendResponse(conn, "-ERR user not specified")
@@ -209,32 +252,48 @@ func handleClient(conn net.Conn) {
 }
 
 func handleTransactionCommand(conn net.Conn, cmd string, args []string, messages []message, toDelete *[]string) {
+	// isDeleted reports whether the 1-based message number has been
+	// marked for deletion in this session. Per RFC 1939, deleted
+	// messages must be invisible to all commands until RSET.
+	isDeleted := func(nr int) bool {
+		return slices.Contains(*toDelete, messages[nr-1].ID)
+	}
+
 	switch cmd {
 	case "STAT":
+		count := 0
 		totalSize := uint64(0)
-		for _, m := range messages {
-			totalSize += m.Size
+		for i, m := range messages {
+			if !isDeleted(i + 1) {
+				count++
+				totalSize += m.Size
+			}
 		}
-		sendResponse(conn, fmt.Sprintf("+OK %d %d", len(messages), totalSize))
+		sendResponse(conn, fmt.Sprintf("+OK %d %d", count, totalSize))
 	case "LIST":
-		totalSize := uint64(0)
-		for _, m := range messages {
-			totalSize += m.Size
-		}
-
 		if len(args) > 0 {
 			arg, _ := getSafeArg(args, 0)
 			nr, err := strconv.Atoi(arg)
-			if err != nil || nr < 1 || nr > len(messages) {
+			if err != nil || nr < 1 || nr > len(messages) || isDeleted(nr) {
 				sendResponse(conn, "-ERR no such message")
 				return
 			}
 			sendResponse(conn, fmt.Sprintf("+OK %d %d", nr, messages[nr-1].Size))
 		} else {
-			sendResponse(conn, fmt.Sprintf("+OK %d messages (%d octets)", len(messages), totalSize))
+			count := 0
+			totalSize := uint64(0)
+			for i, m := range messages {
+				if !isDeleted(i + 1) {
+					count++
+					totalSize += m.Size
+				}
+			}
+			sendResponse(conn, fmt.Sprintf("+OK %d messages (%d octets)", count, totalSize))
 
 			for row, m := range messages {
-				sendResponse(conn, fmt.Sprintf("%d %d", row+1, m.Size))
+				if !isDeleted(row + 1) {
+					sendResponse(conn, fmt.Sprintf("%d %d", row+1, m.Size))
+				}
 			}
 			sendResponse(conn, ".")
 		}
@@ -248,7 +307,7 @@ func handleTransactionCommand(conn net.Conn, cmd string, args []string, messages
 				return
 			}
 
-			if nr < 1 || nr > len(messages) {
+			if nr < 1 || nr > len(messages) || isDeleted(nr) {
 				sendResponse(conn, "-ERR no such message")
 				return
 			}
@@ -259,7 +318,9 @@ func handleTransactionCommand(conn net.Conn, cmd string, args []string, messages
 		} else {
 			sendResponse(conn, "+OK unique-id listing follows")
 			for row, m := range messages {
-				sendResponse(conn, fmt.Sprintf("%d %s", row+1, m.ID))
+				if !isDeleted(row + 1) {
+					sendResponse(conn, fmt.Sprintf("%d %s", row+1, m.ID))
+				}
 			}
 			sendResponse(conn, ".")
 		}
@@ -271,7 +332,7 @@ func handleTransactionCommand(conn net.Conn, cmd string, args []string, messages
 		}
 
 		nr, err := strconv.Atoi(args[0])
-		if err != nil || nr < 1 || nr > len(messages) {
+		if err != nil || nr < 1 || nr > len(messages) || isDeleted(nr) {
 			sendResponse(conn, "-ERR no such message")
 			return
 		}
@@ -300,7 +361,7 @@ func handleTransactionCommand(conn net.Conn, cmd string, args []string, messages
 			return
 		}
 		nr, err := strconv.Atoi(arg)
-		if err != nil || nr < 1 || nr > len(messages) {
+		if err != nil || nr < 1 || nr > len(messages) || isDeleted(nr) {
 			sendResponse(conn, "-ERR no such message")
 			return
 		}
@@ -325,8 +386,9 @@ func handleTransactionCommand(conn net.Conn, cmd string, args []string, messages
 		}
 
 		sendResponse(conn, "+OK top of message follows")
-		sendData(conn, headers+"\r\n")
-		sendData(conn, body)
+		sendData(conn, strings.ReplaceAll(headers, "\n.", "\n.."))
+		sendData(conn, "\r\n")
+		sendData(conn, strings.ReplaceAll(body, "\n.", "\n.."))
 		sendResponse(conn, ".")
 	case "NOOP":
 		sendResponse(conn, "+OK")
@@ -338,8 +400,11 @@ func handleTransactionCommand(conn net.Conn, cmd string, args []string, messages
 			return
 		}
 
-		m := messages[nr-1]
-		*toDelete = append(*toDelete, m.ID)
+		if isDeleted(nr) {
+			sendResponse(conn, "-ERR message already deleted")
+			return
+		}
+		*toDelete = append(*toDelete, messages[nr-1].ID)
 		sendResponse(conn, "+OK message marked for deletion")
 	case "RSET":
 		*toDelete = []string{}

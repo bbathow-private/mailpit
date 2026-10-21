@@ -11,7 +11,6 @@ import (
 	"github.com/axllent/mailpit/internal/logger"
 	"github.com/axllent/mailpit/internal/storage"
 	"github.com/axllent/mailpit/internal/tools"
-	"github.com/gorilla/mux"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
 )
@@ -38,27 +37,29 @@ func GetMessageHTML(w http.ResponseWriter, r *http.Request) {
 	//		400: ErrorResponse
 	//      404: NotFoundResponse
 
-	vars := mux.Vars(r)
-
-	id := vars["id"]
+	path := strings.TrimPrefix(r.URL.Path, config.Webroot+"view/")
+	id := strings.TrimSuffix(path, ".html")
 
 	if id == "latest" {
 		var err error
 		id, err = storage.LatestID(r)
 		if err != nil {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(404)
-			_, _ = fmt.Fprint(w, err.Error())
+			_, _ = fmt.Fprint(w, err.Error()) // #nosec G705 -- served as text/plain
 			return
 		}
 	}
 
 	msg, err := storage.GetMessage(id)
 	if err != nil {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(404)
 		_, _ = fmt.Fprint(w, "Message not found")
 		return
 	}
 	if msg.HTML == "" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(404)
 		_, _ = fmt.Fprint(w, "This message does not contain a HTML part")
 		return
@@ -100,7 +101,7 @@ func GetMessageHTML(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Add("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte(htmlStr))
+	_, _ = w.Write([]byte(htmlStr)) // #nosec G705 -- intentionally renders stored email HTML for UI integration testing
 }
 
 // GetMessageText (method: GET) returns a message's text part
@@ -123,29 +124,30 @@ func GetMessageText(w http.ResponseWriter, r *http.Request) {
 	//		400: ErrorResponse
 	//      404: NotFoundResponse
 
-	vars := mux.Vars(r)
-
-	id := vars["id"]
+	path := strings.TrimPrefix(r.URL.Path, config.Webroot+"view/")
+	id := strings.TrimSuffix(path, ".txt")
 
 	if id == "latest" {
 		var err error
 		id, err = storage.LatestID(r)
 		if err != nil {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(404)
-			_, _ = fmt.Fprint(w, err.Error())
+			_, _ = fmt.Fprint(w, err.Error()) // #nosec G705 -- served as text/plain
 			return
 		}
 	}
 
 	msg, err := storage.GetMessage(id)
 	if err != nil {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(404)
 		_, _ = fmt.Fprint(w, "Message not found")
 		return
 	}
 
 	w.Header().Add("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write([]byte(msg.Text))
+	_, _ = w.Write([]byte(msg.Text)) // #nosec G705 -- served as text/plain, not rendered as HTML
 }
 
 // This will rewrite all inline image paths to API URLs

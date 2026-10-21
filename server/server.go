@@ -4,6 +4,8 @@ package server
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -17,9 +19,12 @@ import (
 
 	"github.com/axllent/mailpit/config"
 	"github.com/axllent/mailpit/internal/auth"
+	"github.com/axllent/mailpit/internal/connlimit"
+	"github.com/axllent/mailpit/internal/licenses"
 	"github.com/axllent/mailpit/internal/logger"
 	"github.com/axllent/mailpit/internal/pop3"
 	"github.com/axllent/mailpit/internal/prometheus"
+	"github.com/axllent/mailpit/internal/shortuuid"
 	"github.com/axllent/mailpit/internal/snakeoil"
 	"github.com/axllent/mailpit/internal/stats"
 	"github.com/axllent/mailpit/internal/storage"
@@ -27,8 +32,6 @@ import (
 	"github.com/axllent/mailpit/server/apiv1"
 	"github.com/axllent/mailpit/server/handlers"
 	"github.com/axllent/mailpit/server/websockets"
-	"github.com/gorilla/mux"
-	"github.com/lithammer/shortuuid/v4"
 )
 
 var (
@@ -36,18 +39,32 @@ var (
 	htmlPreviewRouteRe *regexp.Regexp
 )
 
+// skipUIAuthKey is a private context key used to signal that UI basic-auth
+// should be bypassed for a specific request. This avoids mutating the global
+// auth.UICredentials pointer (which is a data race under concurrent load).
+type contextKey int
+
+const (
+	skipUIAuthKey contextKey = iota
+	// bodyLimitKey carries an optional request body size cap (in bytes) through the
+	// context. middleWareFunc reads it and applies it instead of the default 5 MB cap.
+	// A value of 0 means unlimited. Used by sendAPIAuthMiddleware to honour
+	// config.MaxMessageSize for the send endpoint.
+	bodyLimitKey
+)
+
 // Listen will start the httpd
 func Listen() {
 	setCORSOrigins()
+	setAllowedHosts()
+	warnIfExposedWithoutHostProtection()
 
 	isReady := &atomic.Value{}
 	isReady.Store(false)
 	stats.Track()
 
 	websockets.MessageHub = websockets.NewHub()
-
-	// set allowed websocket origins from configuration
-	// websockets.SetAllowedOrigins(AccessControlAllowWSOrigins)
+	websockets.SetCheckOriginFunc(corsOriginAccessControl)
 
 	go websockets.MessageHub.Run()
 
@@ -56,37 +73,43 @@ func Listen() {
 	r := apiRoutes()
 
 	// kubernetes probes
-	r.HandleFunc(config.Webroot+"livez", handlers.HealthzHandler)
-	r.HandleFunc(config.Webroot+"readyz", handlers.ReadyzHandler(isReady))
+	r.HandleFunc("GET "+config.Webroot+"livez", handlers.HealthzHandler)
+	r.HandleFunc("GET "+config.Webroot+"readyz", handlers.ReadyzHandler(isReady))
 
 	// proxy handler for screenshots
-	r.HandleFunc(config.Webroot+"proxy", middleWareFunc(handlers.ProxyHandler)).Methods("GET")
+	r.HandleFunc("GET "+config.Webroot+"proxy", middleWareFunc(handlers.ProxyHandler))
 
 	// virtual filesystem for /dist/ & some individual files
-	r.PathPrefix(config.Webroot + "dist/").Handler(middleWareFunc(embedController))
-	r.PathPrefix(config.Webroot + "api/").Handler(middleWareFunc(embedController))
-	r.Path(config.Webroot + "favicon.ico").Handler(middleWareFunc(embedController))
-	r.Path(config.Webroot + "favicon.svg").Handler(middleWareFunc(embedController))
-	r.Path(config.Webroot + "mailpit.svg").Handler(middleWareFunc(embedController))
-	r.Path(config.Webroot + "notification.png").Handler(middleWareFunc(embedController))
+	r.Handle("GET "+config.Webroot+"dist/", middleWareFunc(embedController))
+	r.Handle("GET "+config.Webroot+"api/", middleWareFunc(embedController))
+	r.Handle("GET "+config.Webroot+"favicon.ico", middleWareFunc(embedController))
+	r.Handle("GET "+config.Webroot+"favicon.svg", middleWareFunc(embedController))
+	r.Handle("GET "+config.Webroot+"mailpit.svg", middleWareFunc(embedController))
+	r.Handle("GET "+config.Webroot+"notification.png", middleWareFunc(embedController))
 
 	// redirect to webroot if no trailing slash
 	if config.Webroot != "/" {
 		redirect := strings.TrimRight(config.Webroot, "/")
-		r.HandleFunc(redirect, middleWareFunc(addSlashToWebroot)).Methods("GET")
+		r.HandleFunc("GET "+redirect, middleWareFunc(addSlashToWebroot))
 	}
 
 	// UI shortcut
-	r.HandleFunc(config.Webroot+"view/latest", middleWareFunc(handlers.RedirectToLatestMessage)).Methods("GET")
+	r.HandleFunc("GET "+config.Webroot+"view/latest", middleWareFunc(handlers.RedirectToLatestMessage))
 
-	// frontend testing
-	r.HandleFunc(config.Webroot+"view/{id}.html", middleWareFunc(apiv1.GetMessageHTML)).Methods("GET")
-	r.HandleFunc(config.Webroot+"view/{id}.txt", middleWareFunc(apiv1.GetMessageText)).Methods("GET")
+	// frontend testing + web UI via virtual index.html
+	// Go's ServeMux wildcards must span a full path segment so {id}.html is invalid;
+	// viewHandler dispatches on the path suffix instead.
+	r.HandleFunc("GET "+config.Webroot+"view/", middleWareFunc(viewHandler))
 
-	// web UI via virtual index.html
-	r.PathPrefix(config.Webroot + "view/").Handler(middleWareFunc(index)).Methods("GET")
-	r.Path(config.Webroot + "search").Handler(middleWareFunc(index)).Methods("GET")
-	r.Path(config.Webroot).Handler(middleWareFunc(index)).Methods("GET")
+	r.Handle("GET "+config.Webroot+"search", middleWareFunc(index))
+	// Exact-match the webroot; stdlib "/" is always a subtree so we guard inside.
+	r.HandleFunc("GET "+config.Webroot, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != config.Webroot {
+			http.NotFound(w, r)
+			return
+		}
+		middleWareFunc(index)(w, r)
+	})
 
 	if auth.UICredentials != nil {
 		logger.Log().Info("[http] enabling basic authentication")
@@ -96,10 +119,11 @@ func Listen() {
 	isReady.Store(true)
 
 	server := &http.Server{
-		Addr:         config.HTTPListen,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		Handler:      r,
+		Addr:              config.HTTPListen,
+		ReadTimeout:       30 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		Handler:           r,
 	}
 
 	// add temporary self-signed certificates to get deleted afterwards
@@ -111,7 +135,13 @@ func Listen() {
 	if config.UITLSCert != "" && config.UITLSKey != "" {
 		logger.Log().Infof("[http] starting on %s (TLS)", config.HTTPListen)
 		logger.Log().Infof("[http] accessible via https://%s%s", logger.CleanHTTPIP(config.HTTPListen), config.Webroot)
-		if err := server.ListenAndServeTLS(config.UITLSCert, config.UITLSKey); err != nil {
+		ln, err := listenLimited("tcp", config.HTTPListen)
+		if err != nil {
+			storage.Close()
+			logger.Log().Fatal(err)
+		}
+
+		if err := server.ServeTLS(ln, config.UITLSCert, config.UITLSKey); err != nil {
 			storage.Close()
 			logger.Log().Fatal(err)
 		}
@@ -128,7 +158,7 @@ func Listen() {
 			// delete the Unix socket file on exit
 			storage.AddTempFile(socketAddr)
 
-			ln, err := net.Listen("unix", socketAddr)
+			ln, err := listenLimited("unix", socketAddr)
 			if err != nil {
 				storage.Close()
 				logger.Log().Fatal(err)
@@ -149,7 +179,14 @@ func Listen() {
 		} else {
 			logger.Log().Infof("[http] starting on %s", config.HTTPListen)
 			logger.Log().Infof("[http] accessible via http://%s%s", logger.CleanHTTPIP(config.HTTPListen), config.Webroot)
-			if err := server.ListenAndServe(); err != nil {
+
+			ln, err := listenLimited("tcp", config.HTTPListen)
+			if err != nil {
+				storage.Close()
+				logger.Log().Fatal(err)
+			}
+
+			if err := server.Serve(ln); err != nil {
 				storage.Close()
 				logger.Log().Fatal(err)
 			}
@@ -157,56 +194,101 @@ func Listen() {
 	}
 }
 
-func apiRoutes() *mux.Router {
-	r := mux.NewRouter()
+// listenLimited listens on the address, limiting the number of concurrent connections.
+func listenLimited(network, address string) (net.Listener, error) {
+	ln, err := net.Listen(network, address)
+	if err != nil {
+		return nil, err
+	}
+
+	return connlimit.Listener("http", ln, connlimit.Max), nil
+}
+
+// warnIfExposedWithoutHostProtection logs a warning at startup when Mailpit
+// is listening on a non-loopback interface without any of the mitigations
+// against DNS-rebinding attacks in place (Host allowlist or UI auth). The
+// same class of attack technically applies to loopback listens too (the
+// browser can be tricked into resolving an attacker-controlled name to
+// 127.0.0.1 and issuing the request from that context), but browser-side
+// protections such as Chrome's Local Network Access materially reduce that
+// case, whereas a LAN-reachable listener is the shape most likely to be hit
+// in practice and is worth flagging explicitly.
+func warnIfExposedWithoutHostProtection() {
+	if AllowedHosts != "" || auth.UICredentials != nil {
+		return
+	}
+	if _, _, isSocket := tools.UnixSocket(config.HTTPListen); isSocket {
+		return
+	}
+	host, _, err := net.SplitHostPort(config.HTTPListen)
+	if err != nil {
+		return
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" || host == "localhost" || host == "::1" {
+		return
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return
+	}
+	logger.Log().Warnf(
+		"[http] listening on %s without --ui-auth-file or --allowed-hosts; "+
+			"the API is reachable from any host that can route to this interface",
+		config.HTTPListen,
+	)
+}
+
+func apiRoutes() *http.ServeMux {
+	r := http.NewServeMux()
 
 	// API V1
-	r.HandleFunc(config.Webroot+"api/v1/messages", middleWareFunc(apiv1.GetMessages)).Methods("GET")
-	r.HandleFunc(config.Webroot+"api/v1/messages", middleWareFunc(apiv1.SetReadStatus)).Methods("PUT")
-	r.HandleFunc(config.Webroot+"api/v1/messages", middleWareFunc(apiv1.DeleteMessages)).Methods("DELETE")
-	r.HandleFunc(config.Webroot+"api/v1/search", middleWareFunc(apiv1.Search)).Methods("GET")
-	r.HandleFunc(config.Webroot+"api/v1/search", middleWareFunc(apiv1.DeleteSearch)).Methods("DELETE")
-	r.HandleFunc(config.Webroot+"api/v1/send", sendAPIAuthMiddleware(apiv1.SendMessageHandler)).Methods("POST")
-	r.HandleFunc(config.Webroot+"api/v1/tags", middleWareFunc(apiv1.GetAllTags)).Methods("GET")
-	r.HandleFunc(config.Webroot+"api/v1/tags", middleWareFunc(apiv1.SetMessageTags)).Methods("PUT")
-	r.HandleFunc(config.Webroot+"api/v1/tags/{tag}", middleWareFunc(apiv1.RenameTag)).Methods("PUT")
-	r.HandleFunc(config.Webroot+"api/v1/tags/{tag}", middleWareFunc(apiv1.DeleteTag)).Methods("DELETE")
-	r.HandleFunc(config.Webroot+"api/v1/message/{id}/part/{partID}", middleWareFunc(apiv1.DownloadAttachment)).Methods("GET")
-	r.HandleFunc(config.Webroot+"api/v1/message/{id}/part/{partID}/thumb", middleWareFunc(apiv1.Thumbnail)).Methods("GET")
-	r.HandleFunc(config.Webroot+"api/v1/message/{id}/headers", middleWareFunc(apiv1.GetHeaders)).Methods("GET")
-	r.HandleFunc(config.Webroot+"api/v1/message/{id}/raw", middleWareFunc(apiv1.DownloadRaw)).Methods("GET")
-	r.HandleFunc(config.Webroot+"api/v1/message/{id}/release", middleWareFunc(apiv1.ReleaseMessage)).Methods("POST")
-	r.HandleFunc(config.Webroot+"api/v1/message/{id}/html-check", middleWareFunc(apiv1.HTMLCheck)).Methods("GET")
-	r.HandleFunc(config.Webroot+"api/v1/message/{id}/link-check", middleWareFunc(apiv1.LinkCheck)).Methods("GET")
+	r.HandleFunc("GET "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.GetMessages))
+	r.HandleFunc("PUT "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.SetReadStatus))
+	r.HandleFunc("DELETE "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.DeleteMessages))
+	r.HandleFunc("GET "+config.Webroot+"api/v1/search", middleWareFunc(apiv1.Search))
+	r.HandleFunc("DELETE "+config.Webroot+"api/v1/search", middleWareFunc(apiv1.DeleteSearch))
+	r.HandleFunc("POST "+config.Webroot+"api/v1/send", sendAPIAuthMiddleware(apiv1.SendMessageHandler))
+	r.HandleFunc("GET "+config.Webroot+"api/v1/tags", middleWareFunc(apiv1.GetAllTags))
+	r.HandleFunc("PUT "+config.Webroot+"api/v1/tags", middleWareFunc(apiv1.SetMessageTags))
+	r.HandleFunc("PUT "+config.Webroot+"api/v1/tags/{tag}", middleWareFunc(apiv1.RenameTag))
+	r.HandleFunc("DELETE "+config.Webroot+"api/v1/tags/{tag}", middleWareFunc(apiv1.DeleteTag))
+	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/part/{partID}", middleWareFunc(apiv1.DownloadAttachment))
+	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/part/{partID}/thumb", middleWareFunc(apiv1.Thumbnail))
+	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/headers", middleWareFunc(apiv1.GetHeaders))
+	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/raw", middleWareFunc(apiv1.DownloadRaw))
+	r.HandleFunc("POST "+config.Webroot+"api/v1/message/{id}/release", middleWareFunc(apiv1.ReleaseMessage))
+	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/html-check", middleWareFunc(apiv1.HTMLCheck))
+	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/link-check", middleWareFunc(apiv1.LinkCheck))
 	if config.EnableSpamAssassin != "" {
-		r.HandleFunc(config.Webroot+"api/v1/message/{id}/sa-check", middleWareFunc(apiv1.SpamAssassinCheck)).Methods("GET")
+		r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/sa-check", middleWareFunc(apiv1.SpamAssassinCheck))
 	}
-	r.HandleFunc(config.Webroot+"api/v1/message/{id}", middleWareFunc(apiv1.GetMessage)).Methods("GET")
-	r.HandleFunc(config.Webroot+"api/v1/info", middleWareFunc(apiv1.AppInfo)).Methods("GET")
-	r.HandleFunc(config.Webroot+"api/v1/webui", middleWareFunc(apiv1.WebUIConfig)).Methods("GET")
-	r.HandleFunc(config.Webroot+"api/v1/swagger.json", middleWareFunc(swaggerBasePath)).Methods("GET")
+	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}", middleWareFunc(apiv1.GetMessage))
+	r.HandleFunc("GET "+config.Webroot+"api/v1/info", middleWareFunc(apiv1.AppInfo))
+	r.HandleFunc("GET "+config.Webroot+"api/licenses", middleWareFunc(licenseInfo))
+	r.HandleFunc("GET "+config.Webroot+"api/v1/webui", middleWareFunc(apiv1.WebUIConfig))
+	r.HandleFunc("GET "+config.Webroot+"api/v1/swagger.json", middleWareFunc(swaggerBasePath))
 
 	// Chaos
-	r.HandleFunc(config.Webroot+"api/v1/chaos", middleWareFunc(apiv1.GetChaos)).Methods("GET")
-	r.HandleFunc(config.Webroot+"api/v1/chaos", middleWareFunc(apiv1.SetChaos)).Methods("PUT")
+	r.HandleFunc("GET "+config.Webroot+"api/v1/chaos", middleWareFunc(apiv1.GetChaos))
+	r.HandleFunc("PUT "+config.Webroot+"api/v1/chaos", middleWareFunc(apiv1.SetChaos))
 
 	// Bounce rules
-	r.HandleFunc(config.Webroot+"api/v1/bounce-rules", middleWareFunc(apiv1.GetBounceRules)).Methods("GET")
-	r.HandleFunc(config.Webroot+"api/v1/bounce-rules", middleWareFunc(apiv1.SetBounceRules)).Methods("PUT")
-	r.HandleFunc(config.Webroot+"api/v1/bounce-rules", middleWareFunc(apiv1.ClearBounceRules)).Methods("DELETE")
+	r.HandleFunc("GET "+config.Webroot+"api/v1/bounce-rules", middleWareFunc(apiv1.GetBounceRules))
+	r.HandleFunc("PUT "+config.Webroot+"api/v1/bounce-rules", middleWareFunc(apiv1.SetBounceRules))
+	r.HandleFunc("DELETE "+config.Webroot+"api/v1/bounce-rules", middleWareFunc(apiv1.ClearBounceRules))
 
 	// Prometheus metrics (if enabled and using existing server)
 	if prometheus.GetMode() == "integrated" {
-		r.HandleFunc(config.Webroot+"metrics", middleWareFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.HandleFunc("GET "+config.Webroot+"metrics", middleWareFunc(func(w http.ResponseWriter, r *http.Request) {
 			prometheus.GetHandler().ServeHTTP(w, r)
-		})).Methods("GET")
+		}))
 	}
 
 	// web UI websocket
-	r.HandleFunc(config.Webroot+"api/events", apiWebsocket).Methods("GET")
+	r.HandleFunc("GET "+config.Webroot+"api/events", middleWareFunc(apiWebsocket))
 
 	// return blank 200 response for OPTIONS requests for CORS
-	r.PathPrefix(config.Webroot + "api/v1/").Handler(middleWareFunc(apiv1.GetOptions)).Methods("OPTIONS")
+	r.Handle("OPTIONS "+config.Webroot+"api/v1/", middleWareFunc(apiv1.GetOptions))
 
 	return r
 }
@@ -218,22 +300,24 @@ func basicAuthResponse(w http.ResponseWriter) {
 	_, _ = w.Write([]byte("Unauthorized.\n"))
 }
 
-// sendAPIAuthMiddleware handles authentication specifically for the send API endpoint
-// It can use dedicated send API authentication or accept any credentials based on configuration
+// sendAPIAuthMiddleware handles authentication specifically for the send API endpoint.
+// It can use dedicated send API authentication or accept any credentials based on configuration.
+// It communicates skip-UI-auth intent via request context rather than mutating the global
+// auth.UICredentials pointer, which would be a data race under concurrent load.
 func sendAPIAuthMiddleware(fn http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// If send API auth accept any is enabled, bypass all authentication
+		// Override the default 5 MB body cap with the send-specific limit so that
+		// middleWareFunc applies config.MaxMessageSize (0 = unlimited) instead.
+		r = r.WithContext(context.WithValue(r.Context(), bodyLimitKey, int64(config.MaxMessageSize)*1024*1024))
+
+		// If send API auth accept any is enabled, bypass all authentication.
 		if config.SendAPIAuthAcceptAny {
-			// Temporarily disable UI auth for this request
-			originalCredentials := auth.UICredentials
-			auth.UICredentials = nil
-			defer func() { auth.UICredentials = originalCredentials }()
-			// Call the standard middleware
-			middleWareFunc(fn)(w, r)
+			ctx := context.WithValue(r.Context(), skipUIAuthKey, true)
+			middleWareFunc(fn)(w, r.WithContext(ctx))
 			return
 		}
 
-		// If Send API credentials are configured, only accept those credentials
+		// If Send API credentials are configured, only accept those credentials.
 		if auth.SendAPICredentials != nil {
 			user, pass, ok := r.BasicAuth()
 
@@ -247,15 +331,13 @@ func sendAPIAuthMiddleware(fn http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 
-			// Valid Send API credentials - bypass UI auth and call function directly
-			originalCredentials := auth.UICredentials
-			auth.UICredentials = nil
-			defer func() { auth.UICredentials = originalCredentials }()
-			middleWareFunc(fn)(w, r)
+			// Valid Send API credentials — bypass UI auth via context flag.
+			ctx := context.WithValue(r.Context(), skipUIAuthKey, true)
+			middleWareFunc(fn)(w, r.WithContext(ctx))
 			return
 		}
 
-		// No Send API credentials configured - fall back to UI auth
+		// No Send API credentials configured — fall back to UI auth.
 		middleWareFunc(fn)(w, r)
 	}
 }
@@ -273,6 +355,24 @@ func (w gzipResponseWriter) Write(b []byte) (int, error) {
 // and gzip compression.
 func middleWareFunc(fn http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Reject requests whose Host header falls outside --allowed-hosts before
+		// any other work. This runs ahead of the CORS check because the
+		// same-origin branch there compares two client-supplied values and
+		// cannot distinguish a DNS-rebound request on its own; anchoring on
+		// Host against an operator-declared allowlist is what distinguishes it.
+		if !hostAccessControl(r) {
+			http.Error(w, "Blocked due to disallowed Host header", http.StatusForbidden)
+			return
+		}
+
+		// Limit request body size to 5 MB to prevent memory-exhaustion DoS via large
+		// JSON bodies. sendAPIAuthMiddleware sets bodyLimitKey in the context to signal
+		// that the handler manages its own limit (send.go uses config.MaxMessageSize),
+		// so we skip the cap here for that route only.
+		if _, ok := r.Context().Value(bodyLimitKey).(int64); !ok {
+			r.Body = http.MaxBytesReader(w, r.Body, 5*1024*1024)
+		}
+
 		w.Header().Set("Referrer-Policy", "no-referrer")
 
 		// generate a new random nonce on every request
@@ -294,9 +394,9 @@ func middleWareFunc(fn http.HandlerFunc) http.HandlerFunc {
 			htmlPreviewRouteRe = regexp.MustCompile(`^` + regexp.QuoteMeta(config.Webroot) + `view/[a-zA-Z0-9]+\.html$`)
 		}
 
-		if strings.HasPrefix(r.RequestURI, config.Webroot+"api/") || htmlPreviewRouteRe.MatchString(r.RequestURI) {
+		if strings.HasPrefix(r.URL.Path, config.Webroot+"api/") || htmlPreviewRouteRe.MatchString(r.URL.Path) {
 			if allowed := corsOriginAccessControl(r); !allowed {
-				http.Error(w, "Blocked to to CORS violation", http.StatusForbidden)
+				http.Error(w, "Blocked due to CORS violation", http.StatusForbidden)
 				return
 			}
 			w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
@@ -306,8 +406,11 @@ func middleWareFunc(fn http.HandlerFunc) http.HandlerFunc {
 
 		// Check basic authentication headers if configured.
 		// OPTIONS requests are skipped if CORS is enabled, since browsers omit credentials for preflight checks.
+		// skipUIAuthKey in the request context allows sendAPIAuthMiddleware to bypass UI auth
+		// for a specific request without touching the global auth.UICredentials pointer.
+		skipUIAuth, _ := r.Context().Value(skipUIAuthKey).(bool)
 		isCORSOptionsRequest := AccessControlAllowOrigin != "" && r.Method == http.MethodOptions
-		if !isCORSOptionsRequest && auth.UICredentials != nil {
+		if !skipUIAuth && !isCORSOptionsRequest && auth.UICredentials != nil {
 			user, pass, ok := r.BasicAuth()
 
 			if !ok {
@@ -321,7 +424,11 @@ func middleWareFunc(fn http.HandlerFunc) http.HandlerFunc {
 			}
 		}
 
-		if config.DisableHTTPCompression || !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		// WebSocket upgrade requests must not be wrapped in a gzip writer:
+		// gzipResponseWriter does not implement http.Hijacker, which the
+		// WebSocket library requires to take over the raw TCP connection.
+		isWebSocketUpgrade := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+		if isWebSocketUpgrade || config.DisableHTTPCompression || !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 			fn(w, r)
 			return
 		}
@@ -339,16 +446,34 @@ func addSlashToWebroot(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, config.Webroot, http.StatusFound)
 }
 
-// Websocket to broadcast changes
-func apiWebsocket(w http.ResponseWriter, r *http.Request) {
-	if allowed := corsOriginAccessControl(r); !allowed {
-		http.Error(w, "Blocked to to CORS violation", http.StatusForbidden)
-		return
+// viewHandler routes /view/ requests based on path suffix.
+// Go's ServeMux requires wildcards to span a full path segment,
+// so patterns like /view/{id}.html are invalid; we dispatch manually here.
+func viewHandler(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, config.Webroot+"view/")
+	switch {
+	case strings.HasSuffix(path, ".html"):
+		apiv1.GetMessageHTML(w, r)
+	case strings.HasSuffix(path, ".txt"):
+		apiv1.GetMessageText(w, r)
+	default:
+		index(w, r)
 	}
-	w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
-	w.Header().Set("Access-Control-Allow-Headers", "*")
+}
+
+// Websocket to broadcast changes.
+// Authentication and CORS are handled by middleWareFunc before this is reached.
+func apiWebsocket(w http.ResponseWriter, r *http.Request) {
 	websockets.ServeWs(websockets.MessageHub, w, r)
 	storage.BroadcastMailboxStats()
+}
+
+// licenseInfo returns structured license information for Mailpit and its third-party dependencies.
+func licenseInfo(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Add("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(licenses.All()); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	}
 }
 
 // Wrapper to artificially inject a basePath to the swagger.json if a webroot has been specified

@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/mail"
+	"net/url"
+	"strings"
 
 	"github.com/axllent/mailpit/internal/storage"
-	"github.com/gorilla/mux"
 )
 
 // GetMessage (method: GET) returns the Message as JSON
@@ -31,16 +32,15 @@ func GetMessage(w http.ResponseWriter, r *http.Request) {
 	//    400: ErrorResponse
 	//    404: NotFoundResponse
 
-	vars := mux.Vars(r)
-
-	id := vars["id"]
+	id := r.PathValue("id")
 
 	if id == "latest" {
 		var err error
 		id, err = storage.LatestID(r)
 		if err != nil {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(404)
-			_, _ = fmt.Fprint(w, err.Error())
+			_, _ = fmt.Fprint(w, err.Error()) // #nosec G705 -- served as text/plain
 			return
 		}
 	}
@@ -77,16 +77,15 @@ func GetHeaders(w http.ResponseWriter, r *http.Request) {
 	//    400: ErrorResponse
 	//    404: NotFoundResponse
 
-	vars := mux.Vars(r)
-
-	id := vars["id"]
+	id := r.PathValue("id")
 
 	if id == "latest" {
 		var err error
 		id, err = storage.LatestID(r)
 		if err != nil {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(404)
-			_, _ = fmt.Fprint(w, err.Error())
+			_, _ = fmt.Fprint(w, err.Error()) // #nosec G705 -- served as text/plain
 			return
 		}
 	}
@@ -132,17 +131,16 @@ func DownloadAttachment(w http.ResponseWriter, r *http.Request) {
 	//    400: ErrorResponse
 	//    404: NotFoundResponse
 
-	vars := mux.Vars(r)
-
-	id := vars["id"]
-	partID := vars["partID"]
+	id := r.PathValue("id")
+	partID := r.PathValue("partID")
 
 	if id == "latest" {
 		var err error
 		id, err = storage.LatestID(r)
 		if err != nil {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(404)
-			_, _ = fmt.Fprint(w, err.Error())
+			_, _ = fmt.Fprint(w, err.Error()) // #nosec G705 -- served as text/plain
 			return
 		}
 	}
@@ -157,9 +155,18 @@ func DownloadAttachment(w http.ResponseWriter, r *http.Request) {
 		fileName = a.ContentID
 	}
 
-	w.Header().Add("Content-Type", a.ContentType)
-	w.Header().Set("Content-Disposition", "filename=\""+fileName+"\"")
-	_, _ = w.Write(a.Content)
+	contentType := a.ContentType
+	disposition := "inline"
+	mediaType := strings.SplitN(strings.ToLower(contentType), ";", 2)[0]
+	switch mediaType {
+	case "text/html", "text/xml", "application/xhtml+xml",
+		"image/svg+xml", "application/xml", "text/xsl":
+		contentType = "application/octet-stream"
+		disposition = "attachment"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", disposition+"; filename=\""+url.PathEscape(fileName)+"\"")
+	_, _ = w.Write(a.Content) // #nosec G705 -- HTML/SVG/XML content types are forced to application/octet-stream above
 }
 
 // DownloadRaw (method: GET) returns the full email source as plain text
@@ -182,17 +189,16 @@ func DownloadRaw(w http.ResponseWriter, r *http.Request) {
 	//    400: ErrorResponse
 	//    404: NotFoundResponse
 
-	vars := mux.Vars(r)
-
-	id := vars["id"]
-	dl := r.FormValue("dl")
+	id := r.PathValue("id")
+	dl := r.FormValue("dl") // #nosec G120 -- GET request, FormValue only parses URL query string
 
 	if id == "latest" {
 		var err error
 		id, err = storage.LatestID(r)
 		if err != nil {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(404)
-			_, _ = fmt.Fprint(w, err.Error())
+			_, _ = fmt.Fprint(w, err.Error()) // #nosec G705 -- served as text/plain
 			return
 		}
 	}
@@ -207,5 +213,5 @@ func DownloadRaw(w http.ResponseWriter, r *http.Request) {
 	if dl == "1" {
 		w.Header().Set("Content-Disposition", "attachment; filename=\""+id+".eml\"")
 	}
-	_, _ = w.Write(data)
+	_, _ = w.Write(data) // #nosec G705 -- raw email source served as text/plain, not rendered as HTML
 }

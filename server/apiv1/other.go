@@ -11,7 +11,6 @@ import (
 	"github.com/axllent/mailpit/internal/linkcheck"
 	"github.com/axllent/mailpit/internal/spamassassin"
 	"github.com/axllent/mailpit/internal/storage"
-	"github.com/gorilla/mux"
 	"github.com/jhillyerd/enmime/v2"
 )
 
@@ -35,8 +34,7 @@ func HTMLCheck(w http.ResponseWriter, r *http.Request) {
 	//    400: ErrorResponse
 	//    404: NotFoundResponse
 
-	vars := mux.Vars(r)
-	id := vars["id"]
+	id := r.PathValue("id")
 
 	if id == "latest" {
 		var err error
@@ -55,7 +53,7 @@ func HTMLCheck(w http.ResponseWriter, r *http.Request) {
 
 	e := bytes.NewReader(raw)
 
-	parser := enmime.NewParser(enmime.DisableCharacterDetection(true))
+	parser := enmime.NewParser(enmime.DisableCharacterDetection(true), enmime.MaxMIMEParts(500))
 
 	msg, err := parser.ReadEnvelope(e)
 	if err != nil {
@@ -105,8 +103,7 @@ func LinkCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	vars := mux.Vars(r)
-	id := vars["id"]
+	id := r.PathValue("id")
 
 	if id == "latest" {
 		var err error
@@ -126,7 +123,7 @@ func LinkCheck(w http.ResponseWriter, r *http.Request) {
 	f := r.URL.Query().Get("follow")
 	followRedirects := f == "true" || f == "1"
 
-	summary, err := linkcheck.RunTests(msg, followRedirects)
+	summary, err := linkcheck.RunTests(r.Context(), msg, followRedirects)
 	if err != nil {
 		httpError(w, err.Error())
 		return
@@ -158,15 +155,15 @@ func SpamAssassinCheck(w http.ResponseWriter, r *http.Request) {
 	//    400: ErrorResponse
 	//    404: NotFoundResponse
 
-	vars := mux.Vars(r)
-	id := vars["id"]
+	id := r.PathValue("id")
 
 	if id == "latest" {
 		var err error
 		id, err = storage.LatestID(r)
 		if err != nil {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(404)
-			_, _ = fmt.Fprint(w, err.Error())
+			_, _ = fmt.Fprint(w, err.Error()) // #nosec G705 -- served as text/plain
 			return
 		}
 	}

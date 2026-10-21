@@ -7,26 +7,29 @@ import (
 	"github.com/axllent/mailpit/internal/html2text"
 )
 
+// spaceRe is used to normalize whitespace in text by replacing consecutive whitespace characters with a single space.
+var spaceRe = regexp.MustCompile(`\s+`)
+
 // CreateSnippet returns a message snippet. It will use the HTML version (if it exists)
 // otherwise the text version.
 func CreateSnippet(text, html string) string {
 	text = strings.TrimSpace(text)
 	html = strings.TrimSpace(html)
 	limit := 200
-	spaceRe := regexp.MustCompile(`\s+`)
 
 	if text == "" && html == "" {
 		return ""
 	}
 
 	if html != "" {
-		data := html2text.Strip(html, false)
+		data, err := html2text.Strip(html, false)
+		if err == nil {
+			if len(data) <= limit {
+				return data
+			}
 
-		if len(data) <= limit {
-			return data
+			return truncate(data, limit) + "..."
 		}
-
-		return truncate(data, limit) + "..."
 	}
 
 	if text != "" {

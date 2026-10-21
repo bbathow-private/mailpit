@@ -10,22 +10,20 @@ export default {
 	data() {
 		return {
 			mailbox,
-			theme: localStorage.getItem("theme") ? localStorage.getItem("theme") : "auto",
+			theme: localStorage.getItem("mp-theme") ? localStorage.getItem("mp-theme") : "auto",
 			timezones,
 			chaosConfig: false,
 			chaosUpdated: false,
-			defaultReleaseAddressesOptions: localStorage.getItem("defaultReleaseAddresses")
-				? JSON.parse(localStorage.getItem("defaultReleaseAddresses"))
-				: [], // set with default release addresses
+			defaultReleaseAddressesOptions: mailbox.defaultReleaseAddresses.slice(), // set with default release addresses
 		};
 	},
 
 	watch: {
 		theme(v) {
 			if (v === "auto") {
-				localStorage.removeItem("theme");
+				localStorage.removeItem("mp-theme");
 			} else {
-				localStorage.setItem("theme", v);
+				localStorage.setItem("mp-theme", v);
 			}
 			this.setTheme();
 		},
@@ -39,9 +37,9 @@ export default {
 
 		"mailbox.skipConfirmations"(v) {
 			if (v) {
-				localStorage.setItem("skip-confirmations", "true");
+				localStorage.setItem("mp-skip-confirmations", "true");
 			} else {
-				localStorage.removeItem("skip-confirmations");
+				localStorage.removeItem("mp-skip-confirmations");
 			}
 		},
 	},
@@ -49,7 +47,7 @@ export default {
 	mounted() {
 		this.setTheme();
 
-		mailbox.skipConfirmations = localStorage.getItem("skip-confirmations");
+		mailbox.skipConfirmations = localStorage.getItem("mp-skip-confirmations");
 
 		window.setTimeout(() => {
 			Tags.init("select.tz");
@@ -59,8 +57,14 @@ export default {
 
 	methods: {
 		setTheme() {
+			document.documentElement.removeAttribute("data-mp-theme");
+
 			if (this.theme === "auto" && window.matchMedia("(prefers-color-scheme: dark)").matches) {
 				document.documentElement.setAttribute("data-bs-theme", "dark");
+			} else if (this.theme === "deep-dark") {
+				// deep-dark inherits all Bootstrap dark styles with deeper overrides
+				document.documentElement.setAttribute("data-bs-theme", "dark");
+				document.documentElement.setAttribute("data-mp-theme", "deep-dark");
 			} else {
 				document.documentElement.setAttribute("data-bs-theme", this.theme);
 			}
@@ -167,6 +171,7 @@ export default {
 									<option value="auto">Auto (detect from browser)</option>
 									<option value="light">Light theme</option>
 									<option value="dark">Dark theme</option>
+									<option value="deep-dark">Deep dark theme</option>
 								</select>
 							</div>
 							<div class="mb-3">
@@ -252,6 +257,20 @@ export default {
 											<code>Delete all</code> &amp;
 										</template>
 										<code>Mark all read</code> confirmation dialogs
+									</label>
+								</div>
+							</div>
+							<div class="mb-3">
+								<div class="form-check form-switch">
+									<input
+										id="searchSuggestions"
+										v-model="mailbox.showSearchSuggestions"
+										class="form-check-input"
+										type="checkbox"
+										role="switch"
+									/>
+									<label class="form-check-label" for="searchSuggestions">
+										Show search autocomplete suggestions
 									</label>
 								</div>
 							</div>

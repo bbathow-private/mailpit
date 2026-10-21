@@ -20,7 +20,7 @@ func autoForwardMessage(from string, data *[]byte) error {
 	}
 
 	if err := forward(from, *data); err != nil {
-		return errors.WithMessage(err, "[forward] error: %s")
+		return fmt.Errorf("[forward] error: %w", err)
 	}
 
 	logger.Log().Debugf(
@@ -47,6 +47,14 @@ func createForwardingSMTPClient(config config.SMTPForwardConfigStruct, addr stri
 			return nil, fmt.Errorf("SMTP client error: %v", err)
 		}
 
+		// Set the hostname for HELO/EHLO
+		if hostname, err := os.Hostname(); err == nil {
+			if err := client.Hello(hostname); err != nil {
+				_ = client.Close()
+				return nil, fmt.Errorf("error saying HELO/EHLO to %s: %v", addr, err)
+			}
+		}
+
 		// Note: The caller is responsible for closing the client
 		return client, nil
 	}
@@ -59,6 +67,7 @@ func createForwardingSMTPClient(config config.SMTPForwardConfigStruct, addr stri
 	// Set the hostname for HELO/EHLO
 	if hostname, err := os.Hostname(); err == nil {
 		if err := client.Hello(hostname); err != nil {
+			_ = client.Close()
 			return nil, fmt.Errorf("error saying HELO/EHLO to %s: %v", addr, err)
 		}
 	}
@@ -108,9 +117,9 @@ func forward(from string, msg []byte) error {
 		return fmt.Errorf("error response to MAIL command: %s", err.Error())
 	}
 
-	to := strings.Split(config.SMTPForwardConfig.To, ",")
+	to := strings.SplitSeq(config.SMTPForwardConfig.To, ",")
 
-	for _, addr := range to {
+	for addr := range to {
 		if err = c.Rcpt(addr); err != nil {
 			logger.Log().Warnf("error response to RCPT command for %s: %s", addr, err.Error())
 			if config.SMTPForwardConfig.ForwardSMTPErrors {

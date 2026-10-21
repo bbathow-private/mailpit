@@ -16,8 +16,8 @@ import (
 func fourOFour(w http.ResponseWriter) {
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("Content-Security-Policy", config.ContentSecurityPolicy)
-	w.WriteHeader(http.StatusNotFound)
 	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusNotFound)
 	_, _ = fmt.Fprint(w, "404 page not found")
 }
 
@@ -25,19 +25,19 @@ func fourOFour(w http.ResponseWriter) {
 func httpError(w http.ResponseWriter, msg string) {
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("Content-Security-Policy", config.ContentSecurityPolicy)
-	w.WriteHeader(http.StatusBadRequest)
 	w.Header().Set("Content-Type", "text/plain")
-	_, _ = fmt.Fprint(w, msg)
+	w.WriteHeader(http.StatusBadRequest)
+	_, _ = fmt.Fprint(w, msg) // #nosec G705 -- served as text/plain (set above)
 }
 
 // httpJSONError returns a basic error message (400 response) in JSON format
 func httpJSONError(w http.ResponseWriter, msg string) {
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("Content-Security-Policy", config.ContentSecurityPolicy)
+	w.Header().Add("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadRequest)
 	e := struct{ Error string }{Error: msg}
 
-	w.Header().Add("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(e); err != nil {
 		httpError(w, err.Error())
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -42,11 +43,29 @@ func SendMessageHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	decoder := json.NewDecoder(r.Body)
+	if config.MaxMessageSize > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, int64(config.MaxMessageSize)*1024*1024)
+	}
+
+	// Read body before decoding so that MaxBytesReader errors are returned directly.
+	// In Go 1.26+, json.Decoder wraps reader errors in *json.SyntaxError, which
+	// prevents errors.As from finding *http.MaxBytesError to return a 413.
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_ = json.NewEncoder(w).Encode(struct{ Error string }{Error: err.Error()})
+			return
+		}
+		httpJSONError(w, err.Error())
+		return
+	}
 
 	data := sendMessageParams{}
 
-	if err := decoder.Decode(&data.Body); err != nil {
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&data.Body); err != nil {
 		httpJSONError(w, err.Error())
 		return
 	}
@@ -81,8 +100,17 @@ func (d sendMessageParams) Send(remoteAddr string, httpAuthUser *string) (string
 
 	addresses := []string{}
 
+	// enmime.Builder expects the decoded local-part (no quotes) and handles
+	// RFC 5322 quoting itself. Use mail.ParseAddress to decode quoted
+	// local-parts like "odd user"@example.com into enmime's expected form,
+	// while keeping the original Email value for SMTP envelope use.
+	fromEmail := d.Body.From.Email
+	if parsed, err := mail.ParseAddress(d.Body.From.Email); err == nil {
+		fromEmail = parsed.Address
+	}
+
 	msg := enmime.Builder().
-		From(d.Body.From.Name, d.Body.From.Email).
+		From(d.Body.From.Name, fromEmail).
 		Subject(d.Body.Subject).
 		Text([]byte(d.Body.Text))
 
@@ -92,8 +120,8 @@ func (d sendMessageParams) Send(remoteAddr string, httpAuthUser *string) (string
 
 	if len(d.Body.To) > 0 {
 		for _, a := range d.Body.To {
-			if _, err := mail.ParseAddress(a.Email); err == nil {
-				msg = msg.To(a.Name, a.Email)
+			if parsed, err := mail.ParseAddress(a.Email); err == nil {
+				msg = msg.To(a.Name, parsed.Address)
 				addresses = append(addresses, a.Email)
 			} else {
 				return "", fmt.Errorf("invalid To address: %s", a.Email)
@@ -103,8 +131,8 @@ func (d sendMessageParams) Send(remoteAddr string, httpAuthUser *string) (string
 
 	if len(d.Body.Cc) > 0 {
 		for _, a := range d.Body.Cc {
-			if _, err := mail.ParseAddress(a.Email); err == nil {
-				msg = msg.CC(a.Name, a.Email)
+			if parsed, err := mail.ParseAddress(a.Email); err == nil {
+				msg = msg.CC(a.Name, parsed.Address)
 				addresses = append(addresses, a.Email)
 			} else {
 				return "", fmt.Errorf("invalid Cc address: %s", a.Email)
@@ -114,8 +142,8 @@ func (d sendMessageParams) Send(remoteAddr string, httpAuthUser *string) (string
 
 	if len(d.Body.Bcc) > 0 {
 		for _, e := range d.Body.Bcc {
-			if _, err := mail.ParseAddress(e); err == nil {
-				msg = msg.BCC("", e)
+			if parsed, err := mail.ParseAddress(e); err == nil {
+				msg = msg.BCC("", parsed.Address)
 				addresses = append(addresses, e)
 			} else {
 				return "", fmt.Errorf("invalid Bcc address: %s", e)
@@ -125,8 +153,8 @@ func (d sendMessageParams) Send(remoteAddr string, httpAuthUser *string) (string
 
 	if len(d.Body.ReplyTo) > 0 {
 		for _, a := range d.Body.ReplyTo {
-			if _, err := mail.ParseAddress(a.Email); err == nil {
-				msg = msg.ReplyTo(a.Name, a.Email)
+			if parsed, err := mail.ParseAddress(a.Email); err == nil {
+				msg = msg.ReplyTo(a.Name, parsed.Address)
 			} else {
 				return "", fmt.Errorf("invalid Reply-To address: %s", a.Email)
 			}
@@ -142,6 +170,10 @@ func (d sendMessageParams) Send(remoteAddr string, httpAuthUser *string) (string
 
 	if len(d.Body.Headers) > 0 {
 		for k, v := range d.Body.Headers {
+			// validate header key per RFC 5322: printable US-ASCII (33-126) excluding colon
+			if !validHeaderKey(k) {
+				return "", fmt.Errorf("invalid header key: %q", k)
+			}
 			// check header isn't in "restricted" headers
 			if tools.InArray(k, restrictedHeaders) {
 				return "", fmt.Errorf("cannot overwrite header: \"%s\"", k)
@@ -184,4 +216,20 @@ func (d sendMessageParams) Send(remoteAddr string, httpAuthUser *string) (string
 	}
 
 	return smtpd.SaveToDatabase(ipAddr, d.Body.From.Email, addresses, buff.Bytes(), httpAuthUser)
+}
+
+// validHeaderKey returns true if s is a valid RFC 5322 header field name.
+// Field names must be one or more printable US-ASCII characters (33-126),
+// excluding colon (58).
+func validHeaderKey(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 33 || c > 126 || c == ':' {
+			return false
+		}
+	}
+	return true
 }

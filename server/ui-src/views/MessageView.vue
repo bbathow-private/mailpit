@@ -134,7 +134,6 @@ export default {
 
 	methods: {
 		loadMessage() {
-			this.message = false;
 			const uri = this.resolve("/api/v1/message/" + this.$route.params.id);
 			this.get(
 				uri,
@@ -151,8 +150,9 @@ export default {
 						for (const i in d.Inline) {
 							const a = d.Inline[i];
 							if (a.ContentID !== "") {
+								const escapedCID = a.ContentID.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 								d.HTML = d.HTML.replace(
-									new RegExp("(=[\"']?)(cid:" + a.ContentID + ")([\"|'|\\s|\\/|>|;])", "g"),
+									new RegExp("(=[\"']?)(cid:" + escapedCID + ")([\"'|\\s|\\/|>|;])", "g"),
 									"$1" + this.resolve("/api/v1/message/" + d.ID + "/part/" + a.PartID) + "$3",
 								);
 							}
@@ -171,8 +171,9 @@ export default {
 						for (const i in d.Attachments) {
 							const a = d.Attachments[i];
 							if (a.ContentID !== "") {
+								const escapedCID = a.ContentID.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 								d.HTML = d.HTML.replace(
-									new RegExp("(=[\"']?)(cid:" + a.ContentID + ")([\"|'|\\s|\\/|>|;])", "g"),
+									new RegExp("(=[\"']?)(cid:" + escapedCID + ")([\"'|\\s|\\/|>|;])", "g"),
 									"$1" + this.resolve("/api/v1/message/" + d.ID + "/part/" + a.PartID) + "$3",
 								);
 							}
@@ -223,6 +224,11 @@ export default {
 		handleWSNew(data) {
 			// do not add when searching or >= 100 new messages have been received
 			if (this.mailbox.searching || this.liveLoaded >= 100) {
+				return;
+			}
+
+			// ignore if already in the list (race between API response and websocket broadcast)
+			if (this.messagesList.some((m) => m.ID === data.ID)) {
 				return;
 			}
 
@@ -511,6 +517,7 @@ export default {
 					class="btn btn-outline-light dropdown-toggle"
 					data-bs-toggle="dropdown"
 					aria-expanded="false"
+					aria-label="Download"
 				>
 					<i class="bi bi-file-arrow-down-fill"></i>
 					<span class="d-none d-md-inline ms-1">Download</span>
@@ -603,8 +610,13 @@ export default {
 			>
 				<i class="bi bi-caret-left-fill"></i>
 			</RouterLink>
-			<RouterLink :to="'/view/' + nextID" class="btn btn-outline-light" :class="nextID ? '' : 'disabled'">
-				<i class="bi bi-caret-right-fill" title="View next message"></i>
+			<RouterLink
+				:to="'/view/' + nextID"
+				class="btn btn-outline-light"
+				:class="nextID ? '' : 'disabled'"
+				title="View next message"
+			>
+				<i class="bi bi-caret-right-fill"></i>
 			</RouterLink>
 		</div>
 	</div>
@@ -656,9 +668,9 @@ export default {
 						>
 							<div class="col overflow-x-hidden">
 								<div class="text-truncate privacy small">
-									<strong v-if="summary.From" :title="'From: ' + summary.From.Address">
+									<b v-if="summary.From" :title="'From: ' + summary.From.Address">
 										{{ summary.From.Name ? summary.From.Name : summary.From.Address }}
-									</strong>
+									</b>
 								</div>
 							</div>
 							<div class="col-auto small">

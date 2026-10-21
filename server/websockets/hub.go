@@ -3,9 +3,10 @@ package websockets
 
 import (
 	"encoding/json"
-	"time"
+	"sync/atomic"
 
 	"github.com/axllent/mailpit/internal/logger"
+	"github.com/gorilla/websocket"
 )
 
 // Hub maintains the set of active clients and broadcasts messages to the
@@ -22,12 +23,15 @@ type Hub struct {
 
 	// Unregister requests from clients.
 	unregister chan *Client
+
+	// clientCount is an atomic count of connected clients, safe for concurrent reads.
+	clientCount atomic.Int64
 }
 
 // WebsocketNotification struct for responses
 type WebsocketNotification struct {
 	Type string
-	Data interface{}
+	Data any
 }
 
 // NewHub returns a new hub configuration
@@ -48,20 +52,28 @@ func (h *Hub) Run() {
 			if _, ok := h.Clients[client]; !ok {
 				logger.Log().Debugf("[websocket] client %s connected", client.conn.RemoteAddr().String())
 				h.Clients[client] = true
+				h.clientCount.Add(1)
 			}
 		case client := <-h.unregister:
 			if _, ok := h.Clients[client]; ok {
 				logger.Log().Debugf("[websocket] client %s disconnected", client.conn.RemoteAddr().String())
 				delete(h.Clients, client)
 				close(client.send)
+				h.clientCount.Add(-1)
 			}
 		case message := <-h.Broadcast:
+			prepared, err := websocket.NewPreparedMessage(websocket.TextMessage, message)
+			if err != nil {
+				logger.Log().Errorf("[websocket] error preparing message: %s", err.Error())
+				continue
+			}
 			for client := range h.Clients {
 				select {
-				case client.send <- message:
+				case client.send <- prepared:
 				default:
 					close(client.send)
 					delete(h.Clients, client)
+					h.clientCount.Add(-1)
 				}
 			}
 		}
@@ -69,8 +81,8 @@ func (h *Hub) Run() {
 }
 
 // Broadcast will spawn a broadcast message to all connected clients
-func Broadcast(t string, msg interface{}) {
-	if MessageHub == nil || len(MessageHub.Clients) == 0 {
+func Broadcast(t string, msg any) {
+	if MessageHub == nil || MessageHub.clientCount.Load() == 0 {
 		return
 	}
 
@@ -83,10 +95,6 @@ func Broadcast(t string, msg interface{}) {
 		logger.Log().Errorf("[websocket] broadcast received invalid data: %s", err.Error())
 		return
 	}
-
-	// add a very small delay to prevent broadcasts from being interpreted
-	// as a multi-line messages (eg: storage.DeleteMessages() which can send a very quick series)
-	time.Sleep(time.Millisecond)
 
 	go func() { MessageHub.Broadcast <- b }()
 }
